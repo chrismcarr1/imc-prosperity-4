@@ -34,33 +34,36 @@ FAIR_VALUE = 10_000
 POSITION_LIMIT = 20
 BASE_HALF_SPREAD = 2
 MIN_EDGE = 1
-QUOTE_SIZE = 4
-MAX_POSITION_UTILIZATION = 0.95
+QUOTE_SIZE = 10
+MAX_POSITION_UTILIZATION = 1.25
 
 # Inventory and microstructure adjustments.
 INVENTORY_SKEW_PER_UNIT = 0.12
 IMBALANCE_ADJUSTMENT = 1.0
 MAX_IMBALANCE_SHIFT = 1
-JOIN_BEST_QUOTES = True
-IMPROVE_BY_ONE_TICK = False
+JOIN_BEST_QUOTES = False
+IMPROVE_BY_ONE_TICK = True
 
-
+# Listens to order book imbalance, but only between the lower and the minimum of upper/value
 def clamp(value: float, lower: float, upper: float) -> float:
-    return max(lower, min(upper, value))
+    """takes in the value (imbalance x IMBALANCE_ADJUSTMENT), the lower (-MAX_IMBALANCE_SHIFT),
+    and the upper (MAX_IMBALANCE_SHIFT)"""
+    return max(lower, min(upper, value))    # x, but capped between upper and value
 
 
-def compute_order_book_imbalance(
-    bid_volume: Optional[int], ask_volume: Optional[int]
-) -> float:
-    """Return imbalance in [-1, 1]. Positive means more bid support."""
-    if bid_volume is None or ask_volume is None:
+# Function to calculate the actual imbalance between bids and asks
+# Takes in the bid volume and ask volume
+def compute_order_book_imbalance(bid_volume: Optional[int], ask_volume: Optional[int]) -> float:
+    """Return imbalance in [-1, 1]. 1 means all buyers, -1 means all sellers,
+    and 0 means a balanced order book"""
+    if bid_volume is None or ask_volume is None:    # incomplete info so we assume balance
         return 0.0
 
-    total = bid_volume + ask_volume
+    total = bid_volume + ask_volume    # This is the denominator
     if total <= 0:
         return 0.0
 
-    return clamp((bid_volume - ask_volume) / total, -1.0, 1.0)
+    return clamp((bid_volume - ask_volume) / total, -1.0, 1.0)    # again uses clamp like we said
 
 
 class Trader:
@@ -161,13 +164,21 @@ class Trader:
         bid_quote = floor(reservation_price - BASE_HALF_SPREAD)
         ask_quote = ceil(reservation_price + BASE_HALF_SPREAD)
 
-        if best_bid is not None and JOIN_BEST_QUOTES:
-            candidate = best_bid + (1 if IMPROVE_BY_ONE_TICK else 0)
-            bid_quote = max(bid_quote, candidate)
+        if best_bid is not None:
+            if JOIN_BEST_QUOTES:
+                candidate = best_bid + (1 if IMPROVE_BY_ONE_TICK else 0)
+                bid_quote = max(bid_quote, candidate)
+            else:
+                candidate = best_bid + 2
+                bid_quote = max(bid_quote, candidate)
 
-        if best_ask is not None and JOIN_BEST_QUOTES:
-            candidate = best_ask - (1 if IMPROVE_BY_ONE_TICK else 0)
-            ask_quote = min(ask_quote, candidate)
+        if best_ask is not None:
+            if JOIN_BEST_QUOTES:
+                candidate = best_ask - (1 if IMPROVE_BY_ONE_TICK else 0)
+                ask_quote = min(ask_quote, candidate)
+            else:
+                candidate = best_ask - 2
+                ask_quote = min(ask_quote, candidate)
 
         if best_ask is not None:
             bid_quote = min(bid_quote, best_ask - MIN_EDGE)
