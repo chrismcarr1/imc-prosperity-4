@@ -27,7 +27,10 @@ except ImportError:
         traderData: str = ""
 
 
-PRODUCT = "EMERALDS"
+EMERALDS = "EMERALDS"
+TOMATOES = "TOMATOES"
+TOMATOES_ALIASES = (TOMATOES, "TOMATOE")
+PRODUCTS = (EMERALDS, *TOMATOES_ALIASES)
 
 # Core market-making parameters.
 FAIR_VALUE = 10_000
@@ -43,6 +46,13 @@ IMBALANCE_ADJUSTMENT = 1.0
 MAX_IMBALANCE_SHIFT = 1
 JOIN_BEST_QUOTES = False
 IMPROVE_BY_ONE_TICK = True
+
+# Tomatoes mean-reversion parameters.
+TOMATOES_POSITION_LIMIT = 20
+TOMATOES_QUOTE_SIZE = 10
+TOMATOES_WINDOW = 8
+TOMATOES_ENTRY_EDGE = 2
+TOMATOES_EXIT_EDGE = 1
 
 # Listens to order book imbalance, but only between the lower and the minimum of upper/value
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -68,39 +78,101 @@ def compute_order_book_imbalance(bid_volume: Optional[int], ask_volume: Optional
 
 class Trader:
     def run(self, state: TradingState):
-        orders: Dict[str, List[Order]] = {PRODUCT: []}
+        orders: Dict[str, List[Order]] = {
+            product: [] for product in PRODUCTS if product in state.order_depths
+        }
+        trader_state = self._decode_trader_data(state.traderData)
 
-        order_depth = state.order_depths.get(PRODUCT)
-        if order_depth is None:
-            return orders, 0, state.traderData
+        order_depth = state.order_depths.get(EMERALDS)
+        if order_depth is not None:
+            position = state.position.get(EMERALDS, 0)
+            bid_price, bid_volume, ask_price, ask_volume = self._best_bid_ask(order_depth)
 
-        position = state.position.get(PRODUCT, 0)
-        bid_price, bid_volume, ask_price, ask_volume = self._best_bid_ask(order_depth)
+            fair_value = self._fair_value(
+                bid_price=bid_price,
+                ask_price=ask_price,
+                bid_volume=bid_volume,
+                ask_volume=ask_volume,
+            )
+            bid_quote, ask_quote = self._make_quotes(
+                fair_value=fair_value,
+                position=position,
+                best_bid=bid_price,
+                best_ask=ask_price,
+            )
 
-        fair_value = self._fair_value(
-            bid_price=bid_price,
-            ask_price=ask_price,
-            bid_volume=bid_volume,
-            ask_volume=ask_volume,
-        )
-        bid_quote, ask_quote = self._make_quotes(
-            fair_value=fair_value,
-            position=position,
-            best_bid=bid_price,
-            best_ask=ask_price,
-        )
+            buy_size, sell_size = self._quote_sizes(position)
 
-        buy_size, sell_size = self._quote_sizes(position)
+            if buy_size > 0 and bid_quote is not None:
+                orders.setdefault(EMERALDS, []).append(Order(EMERALDS, bid_quote, buy_size))
+            if sell_size > 0 and ask_quote is not None:
+                orders.setdefault(EMERALDS, []).append(Order(EMERALDS, ask_quote, -sell_size))
 
-        if buy_size > 0 and bid_quote is not None:
-            orders[PRODUCT].append(Order(PRODUCT, bid_quote, buy_size))
-        if sell_size > 0 and ask_quote is not None:
-            orders[PRODUCT].append(Order(PRODUCT, ask_quote, -sell_size))
+            trader_state["emeralds"] = (
+                f"fv={fair_value:.2f},pos={position},bid={bid_quote},ask={ask_quote}"
+            )
 
-        trader_data = (
-            f"fv={fair_value:.2f}|pos={position}|bid={bid_quote}|ask={ask_quote}"
-        )
+        tomato_symbol = self._first_available_product(state.order_depths, TOMATOES_ALIASES)
+        tomato_depth = state.order_depths.get(tomato_symbol) if tomato_symbol else None
+        if tomato_depth is not None and tomato_symbol is not None:
+            tomato_orders, tomato_data = self._trade_tomatoes(
+                product=tomato_symbol,
+                order_depth=tomato_depth,
+                position=state.position.get(tomato_symbol, 0),
+                trader_data=trader_state.get("tomatoes", ""),
+            )
+            orders.setdefault(tomato_symbol, []).extend(tomato_orders)
+            trader_state["tomatoes"] = tomato_data
+
+        trader_data = self._encode_trader_data(trader_state)
         return orders, 0, trader_data
+
+    def _trade_tomatoes(
+        self,
+        product: str,
+        order_depth: OrderDepth,
+        position: int,
+        trader_data: str,
+    ) -> Tuple[List[Order], str]:
+        orders: List[Order] = []
+        best_bid, _, best_ask, _ = self._best_bid_ask(order_depth)
+
+        history = self._parse_price_history(trader_data)
+        if best_bid is not None and best_ask is not None and best_bid < best_ask:
+            history.append((best_bid + best_ask) / 2)
+        history = history[-TOMATOES_WINDOW:]
+
+        if not history:
+            return orders, ""
+
+        mean_price = sum(history) / len(history)
+        buy_capacity = max(0, TOMATOES_POSITION_LIMIT - position)
+        sell_capacity = max(0, TOMATOES_POSITION_LIMIT + position)
+
+        if best_ask is not None:
+            buy_edge = TOMATOES_ENTRY_EDGE if position >= 0 else TOMATOES_EXIT_EDGE
+            if best_ask <= mean_price - buy_edge and buy_capacity > 0:
+                orders.append(
+                    Order(
+                        product,
+                        best_ask,
+                        min(TOMATOES_QUOTE_SIZE, buy_capacity, abs(order_depth.sell_orders.get(best_ask, 0))),
+                    )
+                )
+
+        if best_bid is not None:
+            sell_edge = TOMATOES_ENTRY_EDGE if position <= 0 else TOMATOES_EXIT_EDGE
+            if best_bid >= mean_price + sell_edge and sell_capacity > 0:
+                orders.append(
+                    Order(
+                        product,
+                        best_bid,
+                        -min(TOMATOES_QUOTE_SIZE, sell_capacity, order_depth.buy_orders.get(best_bid, 0)),
+                    )
+                )
+
+        history_str = ",".join(f"{price:.1f}" for price in history)
+        return orders, history_str
 
     def _best_bid_ask(
         self, order_depth: OrderDepth
@@ -212,3 +284,41 @@ class Trader:
             sell_size = min(sell_size, max(1, QUOTE_SIZE - abs(position) // 5))
 
         return buy_size, sell_size
+
+    def _decode_trader_data(self, trader_data: str) -> Dict[str, str]:
+        decoded: Dict[str, str] = {}
+        if not trader_data:
+            return decoded
+
+        for segment in trader_data.split(";"):
+            if "=" not in segment:
+                continue
+            key, value = segment.split("=", 1)
+            if key:
+                decoded[key] = value
+        return decoded
+
+    def _encode_trader_data(self, trader_state: Dict[str, str]) -> str:
+        return ";".join(
+            f"{key}={value}" for key, value in trader_state.items() if value
+        )
+
+    def _parse_price_history(self, trader_data: str) -> List[float]:
+        if not trader_data:
+            return []
+
+        prices: List[float] = []
+        for value in trader_data.split(","):
+            try:
+                prices.append(float(value))
+            except ValueError:
+                continue
+        return prices
+
+    def _first_available_product(
+        self, order_depths: Dict[str, OrderDepth], candidates: Tuple[str, ...]
+    ) -> Optional[str]:
+        for product in candidates:
+            if product in order_depths:
+                return product
+        return None
