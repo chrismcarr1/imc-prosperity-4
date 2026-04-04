@@ -47,12 +47,18 @@ MAX_IMBALANCE_SHIFT = 1
 JOIN_BEST_QUOTES = False
 IMPROVE_BY_ONE_TICK = True
 
-# Tomatoes mean-reversion parameters.
+# Tomatoes market-making parameters.
 TOMATOES_POSITION_LIMIT = 20
-TOMATOES_QUOTE_SIZE = 10
-TOMATOES_WINDOW = 7
-TOMATOES_ENTRY_EDGE = 2
-TOMATOES_EXIT_EDGE = 1
+TOMATOES_QUOTE_SIZE = 5
+TOMATOES_BASE_HALF_SPREAD = 3
+TOMATOES_MIN_EDGE = 1
+TOMATOES_INVENTORY_SKEW_PER_UNIT = 0.10
+TOMATOES_FAIR_ALPHA = 0.18
+TOMATOES_TREND_WEIGHT = 0.25
+TOMATOES_MAX_TREND_SHIFT = 2.0
+TOMATOES_IMBALANCE_ADJUSTMENT = 0.35
+TOMATOES_MAX_IMBALANCE_SHIFT = 0.5
+TOMATOES_HISTORY_LENGTH = 8
 
 # Listens to order book imbalance, but only between the lower and the minimum of upper/value
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -135,41 +141,37 @@ class Trader:
         trader_data: str,
     ) -> Tuple[List[Order], str]:
         orders: List[Order] = []
-        best_bid, _, best_ask, _ = self._best_bid_ask(order_depth)
-
+        best_bid, bid_volume, best_ask, ask_volume = self._best_bid_ask(order_depth)
         history = self._parse_price_history(trader_data)
+
         if best_bid is not None and best_ask is not None and best_bid < best_ask:
             history.append((best_bid + best_ask) / 2)
-        history = history[-TOMATOES_WINDOW:]
+        history = history[-TOMATOES_HISTORY_LENGTH:]
 
         if not history:
             return orders, ""
 
-        mean_price = sum(history) / len(history)
-        buy_capacity = max(0, TOMATOES_POSITION_LIMIT - position)
-        sell_capacity = max(0, TOMATOES_POSITION_LIMIT + position)
+        fair_value = self._tomatoes_fair_value(
+            history=history,
+            bid_volume=bid_volume,
+            ask_volume=ask_volume,
+        )
+        bid_quote, ask_quote = self._make_tomatoes_quotes(
+            fair_value=fair_value,
+            position=position,
+            best_bid=best_bid,
+            best_ask=best_ask,
+        )
+        buy_size, sell_size = self._quote_sizes_with_params(
+            position=position,
+            position_limit=TOMATOES_POSITION_LIMIT,
+            quote_size=TOMATOES_QUOTE_SIZE,
+        )
 
-        if best_ask is not None:
-            buy_edge = TOMATOES_ENTRY_EDGE if position >= 0 else TOMATOES_EXIT_EDGE
-            if best_ask <= mean_price - buy_edge and buy_capacity > 0:
-                orders.append(
-                    Order(
-                        product,
-                        best_ask,
-                        min(TOMATOES_QUOTE_SIZE, buy_capacity, abs(order_depth.sell_orders.get(best_ask, 0))),
-                    )
-                )
-
-        if best_bid is not None:
-            sell_edge = TOMATOES_ENTRY_EDGE if position <= 0 else TOMATOES_EXIT_EDGE
-            if best_bid >= mean_price + sell_edge and sell_capacity > 0:
-                orders.append(
-                    Order(
-                        product,
-                        best_bid,
-                        -min(TOMATOES_QUOTE_SIZE, sell_capacity, order_depth.buy_orders.get(best_bid, 0)),
-                    )
-                )
+        if buy_size > 0 and bid_quote is not None:
+            orders.append(Order(product, bid_quote, buy_size))
+        if sell_size > 0 and ask_quote is not None:
+            orders.append(Order(product, ask_quote, -sell_size))
 
         history_str = ",".join(f"{price:.1f}" for price in history)
         return orders, history_str
@@ -265,23 +267,31 @@ class Trader:
         return bid_quote, ask_quote
 
     def _quote_sizes(self, position: int) -> Tuple[int, int]:
-        usable_limit = int(POSITION_LIMIT * MAX_POSITION_UTILIZATION)
-        buy_capacity = max(0, POSITION_LIMIT - position)
-        sell_capacity = max(0, POSITION_LIMIT + position)
+        return self._quote_sizes_with_params(position, POSITION_LIMIT, QUOTE_SIZE)
 
-        buy_size = min(QUOTE_SIZE, buy_capacity)
-        sell_size = min(QUOTE_SIZE, sell_capacity)
+    def _quote_sizes_with_params(
+        self,
+        position: int,
+        position_limit: int,
+        quote_size: int,
+    ) -> Tuple[int, int]:
+        usable_limit = int(position_limit * MAX_POSITION_UTILIZATION)
+        buy_capacity = max(0, position_limit - position)
+        sell_capacity = max(0, position_limit + position)
+
+        buy_size = min(quote_size, buy_capacity)
+        sell_size = min(quote_size, sell_capacity)
 
         # Fade the quote on the side that would worsen inventory once usage gets high.
         if position >= usable_limit:
             buy_size = 0
         elif position > 0:
-            buy_size = min(buy_size, max(1, QUOTE_SIZE - position // 5))
+            buy_size = min(buy_size, max(1, quote_size - position // 5))
 
         if position <= -usable_limit:
             sell_size = 0
         elif position < 0:
-            sell_size = min(sell_size, max(1, QUOTE_SIZE - abs(position) // 5))
+            sell_size = min(sell_size, max(1, quote_size - abs(position) // 5))
 
         return buy_size, sell_size
 
@@ -314,6 +324,68 @@ class Trader:
             except ValueError:
                 continue
         return prices
+
+    def _tomatoes_fair_value(
+        self,
+        history: List[float],
+        bid_volume: Optional[int],
+        ask_volume: Optional[int],
+    ) -> float:
+        ema = history[0]
+        for price in history[1:]:
+            ema = (1 - TOMATOES_FAIR_ALPHA) * ema + TOMATOES_FAIR_ALPHA * price
+
+        trend_shift = 0.0
+        if len(history) >= 4:
+            recent = sum(history[-3:]) / 3
+            previous = sum(history[-6:-3]) / 3 if len(history) >= 6 else sum(history[:-3]) / max(1, len(history) - 3)
+            trend_shift = clamp(
+                (recent - previous) * TOMATOES_TREND_WEIGHT,
+                -TOMATOES_MAX_TREND_SHIFT,
+                TOMATOES_MAX_TREND_SHIFT,
+            )
+
+        imbalance = compute_order_book_imbalance(bid_volume, ask_volume)
+        imbalance_shift = clamp(
+            imbalance * TOMATOES_IMBALANCE_ADJUSTMENT,
+            -TOMATOES_MAX_IMBALANCE_SHIFT,
+            TOMATOES_MAX_IMBALANCE_SHIFT,
+        )
+        return ema + trend_shift + imbalance_shift
+
+    def _make_tomatoes_quotes(
+        self,
+        fair_value: float,
+        position: int,
+        best_bid: Optional[int],
+        best_ask: Optional[int],
+    ) -> Tuple[Optional[int], Optional[int]]:
+        inventory_shift = position * TOMATOES_INVENTORY_SKEW_PER_UNIT
+        reservation_price = fair_value - inventory_shift
+
+        bid_quote = floor(reservation_price - TOMATOES_BASE_HALF_SPREAD)
+        ask_quote = ceil(reservation_price + TOMATOES_BASE_HALF_SPREAD)
+
+        if best_bid is not None:
+            bid_quote = max(bid_quote, best_bid + 1)
+        if best_ask is not None:
+            ask_quote = min(ask_quote, best_ask - 1)
+
+        if best_ask is not None:
+            bid_quote = min(bid_quote, best_ask - TOMATOES_MIN_EDGE)
+        if best_bid is not None:
+            ask_quote = max(ask_quote, best_bid + TOMATOES_MIN_EDGE)
+
+        if bid_quote >= ask_quote:
+            center = round(reservation_price)
+            bid_quote = center - 1
+            ask_quote = center + 1
+            if best_ask is not None:
+                bid_quote = min(bid_quote, best_ask - TOMATOES_MIN_EDGE)
+            if best_bid is not None:
+                ask_quote = max(ask_quote, best_bid + TOMATOES_MIN_EDGE)
+
+        return bid_quote, ask_quote
 
     def _first_available_product(
         self, order_depths: Dict[str, OrderDepth], candidates: Tuple[str, ...]
