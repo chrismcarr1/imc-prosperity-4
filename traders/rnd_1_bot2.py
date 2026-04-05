@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from math import ceil, floor
 from typing import Dict, List, Optional, Tuple
@@ -44,8 +42,7 @@ MAX_POSITION_UTILIZATION = 1.25
 INVENTORY_SKEW_PER_UNIT = 0.12
 IMBALANCE_ADJUSTMENT = 1.0
 MAX_IMBALANCE_SHIFT = 1
-JOIN_BEST_QUOTES = False
-IMPROVE_BY_ONE_TICK = True
+QUOTE_ADJUSTMENT = 2
 
 # Tomatoes market-making parameters.
 TOMATOES_POSITION_LIMIT = 20
@@ -83,10 +80,9 @@ def compute_order_book_imbalance(bid_volume: Optional[int], ask_volume: Optional
 
 
 class Trader:
+
     def run(self, state: TradingState):
-        orders: Dict[str, List[Order]] = {
-            product: [] for product in PRODUCTS if product in state.order_depths
-        }
+        orders: Dict[str, List[Order]] = {product: [] for product in PRODUCTS if product in state.order_depths}
         trader_state = self._decode_trader_data(state.traderData)
 
         order_depth = state.order_depths.get(EMERALDS)
@@ -114,13 +110,9 @@ class Trader:
             if sell_size > 0 and ask_quote is not None:
                 orders.setdefault(EMERALDS, []).append(Order(EMERALDS, ask_quote, -sell_size))
 
-            trader_state["emeralds"] = (
-                f"fv={fair_value:.2f},pos={position},bid={bid_quote},ask={ask_quote}"
-            )
-
         tomato_symbol = self._first_available_product(state.order_depths, TOMATOES_ALIASES)
         tomato_depth = state.order_depths.get(tomato_symbol) if tomato_symbol else None
-        if tomato_depth is not None and tomato_symbol is not None:
+        if tomato_depth is not None:
             tomato_orders, tomato_data = self._trade_tomatoes(
                 product=tomato_symbol,
                 order_depth=tomato_depth,
@@ -133,13 +125,7 @@ class Trader:
         trader_data = self._encode_trader_data(trader_state)
         return orders, 0, trader_data
 
-    def _trade_tomatoes(
-        self,
-        product: str,
-        order_depth: OrderDepth,
-        position: int,
-        trader_data: str,
-    ) -> Tuple[List[Order], str]:
+    def _trade_tomatoes(self,product: str, order_depth: OrderDepth, position: int, trader_data: str):
         orders: List[Order] = []
         best_bid, bid_volume, best_ask, ask_volume = self._best_bid_ask(order_depth)
         history = self._parse_price_history(trader_data)
@@ -176,62 +162,34 @@ class Trader:
         history_str = ",".join(f"{price:.1f}" for price in history)
         return orders, history_str
 
-    def _best_bid_ask(
-        self, order_depth: OrderDepth
-    ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    def _best_bid_ask(self, order_depth: OrderDepth):
         best_bid = max(order_depth.buy_orders) if order_depth.buy_orders else None
         best_ask = min(order_depth.sell_orders) if order_depth.sell_orders else None
 
-        bid_volume = (
-            order_depth.buy_orders.get(best_bid) if best_bid is not None else None
-        )
-        ask_volume = (
-            abs(order_depth.sell_orders.get(best_ask, 0))
-            if best_ask is not None
-            else None
-        )
+        bid_volume = (order_depth.buy_orders.get(best_bid) if best_bid is not None else None)
+        ask_volume = (abs(order_depth.sell_orders.get(best_ask)) if best_ask is not None else None)
+
         return best_bid, bid_volume, best_ask, ask_volume
 
-    def _fair_value(
-        self,
-        bid_price: Optional[int],
-        ask_price: Optional[int],
-        bid_volume: Optional[int],
-        ask_volume: Optional[int],
-    ) -> float:
-        """
-        Start from the known EMERALDS anchor and add only a small bounded
-        microstructure adjustment. This keeps the strategy market-making
-        oriented rather than predictive.
-        """
+    def _fair_value(self, bid_price, ask_price, bid_volume, ask_volume):
+
         fair_value = float(FAIR_VALUE)
 
         imbalance = compute_order_book_imbalance(bid_volume, ask_volume)
-        imbalance_shift = clamp(
-            imbalance * IMBALANCE_ADJUSTMENT,
-            -MAX_IMBALANCE_SHIFT,
-            MAX_IMBALANCE_SHIFT,
-        )
+        imbalance_shift = clamp(imbalance * IMBALANCE_ADJUSTMENT, -MAX_IMBALANCE_SHIFT, MAX_IMBALANCE_SHIFT)
+
         fair_value += imbalance_shift
 
-        if bid_price is not None and ask_price is not None and bid_price < ask_price:
+        if bid_price is not None and ask_price is not None:
             mid_price = (bid_price + ask_price) / 2
             fair_value = 0.8 * fair_value + 0.2 * mid_price
 
         return fair_value
 
-    def _make_quotes(
-        self,
-        fair_value: float,
-        position: int,
-        best_bid: Optional[int],
-        best_ask: Optional[int],
-    ) -> Tuple[Optional[int], Optional[int]]:
-        """
-        Inventory shifts the reservation price:
-        long inventory lowers quotes to encourage selling,
-        short inventory raises quotes to encourage buying.
-        """
+    def _make_quotes(self, fair_value, position, best_bid, best_ask):
+        """Inventory shifts the reservation price: long inventory lowers quotes to encourage selling, short 
+        inventory raises quotes to encourage buying."""
+
         inventory_shift = position * INVENTORY_SKEW_PER_UNIT
         reservation_price = fair_value - inventory_shift
 
@@ -239,23 +197,16 @@ class Trader:
         ask_quote = ceil(reservation_price + BASE_HALF_SPREAD)
 
         if best_bid is not None:
-            if JOIN_BEST_QUOTES:
-                candidate = best_bid + (1 if IMPROVE_BY_ONE_TICK else 0)
-                bid_quote = max(bid_quote, candidate)
-            else:
-                candidate = best_bid + 2
-                bid_quote = max(bid_quote, candidate)
+            candidate = best_bid + QUOTE_ADJUSTMENT
+            bid_quote = max(bid_quote, candidate)
 
         if best_ask is not None:
-            if JOIN_BEST_QUOTES:
-                candidate = best_ask - (1 if IMPROVE_BY_ONE_TICK else 0)
-                ask_quote = min(ask_quote, candidate)
-            else:
-                candidate = best_ask - 2
-                ask_quote = min(ask_quote, candidate)
+            candidate = best_ask - QUOTE_ADJUSTMENT
+            ask_quote = min(ask_quote, candidate)
 
         if best_ask is not None:
             bid_quote = min(bid_quote, best_ask - MIN_EDGE)
+
         if best_bid is not None:
             ask_quote = max(ask_quote, best_bid + MIN_EDGE)
 
@@ -266,15 +217,11 @@ class Trader:
 
         return bid_quote, ask_quote
 
-    def _quote_sizes(self, position: int) -> Tuple[int, int]:
+    def _quote_sizes(self, position):
         return self._quote_sizes_with_params(position, POSITION_LIMIT, QUOTE_SIZE)
 
-    def _quote_sizes_with_params(
-        self,
-        position: int,
-        position_limit: int,
-        quote_size: int,
-    ) -> Tuple[int, int]:
+    def _quote_sizes_with_params(self, position, position_limit, quote_size):
+
         usable_limit = int(position_limit * MAX_POSITION_UTILIZATION)
         buy_capacity = max(0, position_limit - position)
         sell_capacity = max(0, position_limit + position)
@@ -325,12 +272,7 @@ class Trader:
                 continue
         return prices
 
-    def _tomatoes_fair_value(
-        self,
-        history: List[float],
-        bid_volume: Optional[int],
-        ask_volume: Optional[int],
-    ) -> float:
+    def _tomatoes_fair_value(self, history, bid_volume, ask_volume):
         ema = history[0]
         for price in history[1:]:
             ema = (1 - TOMATOES_FAIR_ALPHA) * ema + TOMATOES_FAIR_ALPHA * price
@@ -353,13 +295,7 @@ class Trader:
         )
         return ema + trend_shift + imbalance_shift
 
-    def _make_tomatoes_quotes(
-        self,
-        fair_value: float,
-        position: int,
-        best_bid: Optional[int],
-        best_ask: Optional[int],
-    ) -> Tuple[Optional[int], Optional[int]]:
+    def _make_tomatoes_quotes(self, fair_value, position, best_bid, best_ask):
         inventory_shift = position * TOMATOES_INVENTORY_SKEW_PER_UNIT
         reservation_price = fair_value - inventory_shift
 
@@ -387,9 +323,7 @@ class Trader:
 
         return bid_quote, ask_quote
 
-    def _first_available_product(
-        self, order_depths: Dict[str, OrderDepth], candidates: Tuple[str, ...]
-    ) -> Optional[str]:
+    def _first_available_product(self, order_depths: Dict[str, OrderDepth], candidates: Tuple[str, ...]):
         for product in candidates:
             if product in order_depths:
                 return product
