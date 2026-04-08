@@ -2,30 +2,15 @@ from dataclasses import dataclass, field
 from math import ceil, floor
 from typing import Dict, List, Optional, Tuple
 from itertools import product
+import json
+from typing import Dict, List
+from json import JSONEncoder
+import jsonpickle
+from datamodel import OrderDepth, UserId, TradingState, Order
 
-try:
-    from datamodel import Order, OrderDepth, TradingState
-except ImportError:
-    # Fallbacks keep the file importable in local notebooks or tests where the
-    # competition datamodel module is not present.
-    @dataclass
-    class Order:
-        symbol: str
-        price: int
-        quantity: int
-
-    @dataclass
-    class OrderDepth:
-        buy_orders: Dict[int, int] = field(default_factory=dict)
-        sell_orders: Dict[int, int] = field(default_factory=dict)
-
-    @dataclass
-    class TradingState:
-        order_depths: Dict[str, OrderDepth]
-        position: Dict[str, int] = field(default_factory=dict)
-        traderData: str = ""
-
-
+# Assumptions for model
+STATIC_SYMBOL = "EMERALDS"
+DYNAMIC_SYMBOL = "TOMATOES"
 EMERALDS = "EMERALDS"
 TOMATOES = "TOMATOES"
 TOMATOES_ALIASES = (TOMATOES, "TOMATOE")
@@ -79,12 +64,200 @@ def compute_order_book_imbalance(bid_volume: Optional[int], ask_volume: Optional
 
     return clamp((bid_volume - ask_volume) / total, -1.0, 1.0)    # again uses clamp like we said
 
+Time = int
+Symbol = str
+Product = str
+Position = int
+UserId = str
+ObservationValue = int
+
+class Listing:
+
+    def __init__(self, symbol: Symbol, product: Product, denomination: Product):
+        self.symbol = symbol
+        self.product = product
+        self.denomination = denomination
+                 
+class ConversionObservation:
+
+    def __init__(self, 
+                 bidPrice: float, 
+                 askPrice: float, 
+                 transportFees: float, 
+                 exportTariff: float, 
+                 importTariff: float, 
+                 sunlight: float, 
+                 humidity: float):
+        self.bidPrice = bidPrice
+        self.askPrice = askPrice
+        self.transportFees = transportFees
+        self.exportTariff = exportTariff
+        self.importTariff = importTariff
+        self.sugarPrice = sugarPrice
+        self.sunlightIndex = sunlightIndex
+
+class Observation:
+
+    def __init__(self, 
+                 plainValueObservations: Dict[Product, ObservationValue], 
+                 conversionObservations: Dict[Product, ConversionObservation]) -> None:
+        self.plainValueObservations = plainValueObservations
+        self.conversionObservations = conversionObservations
+        
+    def __str__(self) -> str:
+        return "(plainValueObservations: " + jsonpickle.encode(self.plainValueObservations) 
+    + ", conversionObservations: " + jsonpickle.encode(self.conversionObservations) + ")"
+     
+
+class Order:
+
+    def __init__(self, symbol: Symbol, price: int, quantity: int) -> None:
+        self.symbol = symbol
+        self.price = price
+        self.quantity = quantity
+
+    def __str__(self) -> str:
+        return "(" + self.symbol + ", " + str(self.price) + ", " + str(self.quantity) + ")"
+
+    def __repr__(self) -> str:
+        return "(" + self.symbol + ", " + str(self.price) + ", " + str(self.quantity) + ")"
+    
+
+class OrderDepth:
+
+    def __init__(self):
+        self.buy_orders: Dict[int, int] = {}
+        self.sell_orders: Dict[int, int] = {}
+
+
+class Trade:
+
+    def __init__(self, 
+                 symbol: Symbol, 
+                 price: int, 
+                 quantity: int, 
+                 buyer: UserId=None, 
+                 seller: UserId=None, 
+                 timestamp: int=0) -> None:
+        self.symbol = symbol
+        self.price: int = price
+        self.quantity: int = quantity
+        self.buyer = buyer
+        self.seller = seller
+        self.timestamp = timestamp
+
+    def __str__(self) -> str:
+        return "(" + self.symbol + ", " + self.buyer + " << " + self.seller + ", " + str(self.price) + ", " + str(self.quantity) + ", " + str(self.timestamp) + ")"
+
+    def __repr__(self) -> str:
+        return "(" + self.symbol + ", " + self.buyer + " << " + self.seller + ", " + str(self.price) + ", " + str(self.quantity) + ", " + str(self.timestamp) + ")"
+
+
+class TradingState(object):
+
+    def __init__(self,
+                 traderData: str,
+                 timestamp: Time,
+                 listings: Dict[Symbol, Listing],
+                 order_depths: Dict[Symbol, OrderDepth],
+                 own_trades: Dict[Symbol, List[Trade]],
+                 market_trades: Dict[Symbol, List[Trade]],
+                 position: Dict[Product, Position],
+                 observations: Observation):
+        self.traderData = traderData
+        self.timestamp = timestamp
+        self.listings = listings
+        self.order_depths = order_depths
+        self.own_trades = own_trades
+        self.market_trades = market_trades
+        self.position = position
+        self.observations = observations
+        
+    def toJSON(self):
+        return json.dumps(self, default=lambda o: o.__dict__, sort_keys=True)
+
+    
+class ProsperityEncoder(JSONEncoder):
+
+        def default(self, o):
+            return o.__dict__
+
 
 class Trader:
 
     def run(self, state: TradingState):
-        orders: Dict[str, List[Order]] = {product: [] for product in PRODUCTS if product in state.order_depths}
-        trader_state = self._decode_trader_data(state.traderData)
+        result:dict[str,list[Order]] = {}
+        new_trader_data = {}
+        prints = {
+            "GENERAL": {
+                "TIMESTAMP": state.timestamp,
+                "POSITIONS": state.position
+            },
+        }
+
+        def export(prints):
+            try: print(json.dumps(prints))
+            except: pass
+
+
+        product_traders = {
+            STATIC_SYMBOL: StaticTrader,
+            DYNAMIC_SYMBOL: DynamicTrader,
+        }
+
+        result, conversions = {}, 0
+        for symbol, product_trader in product_traders.items():
+            if symbol in state.order_depths:
+
+                try:
+                    trader = product_trader(state, prints, new_trader_data)
+                    result.update(trader.get_orders())
+
+                    if symbol == COMMODITY_SYMBOL:
+                        conversions = trader.get_conversions()
+                except: pass
+
+
+        try: final_trader_data = json.dumps(new_trader_data)
+        except: final_trader_data = ''
+
+
+        export(prints)
+        return result, conversions, final_trader_data
+
+class Trader:
+
+    def run(self, state: TradingState):
+        
+        print("traderData: " + state.traderData)
+        print("Observations: " + str(state.observations))
+        
+        result = {}
+        for product in state.order_depths:
+            order_depth: OrderDepth = state.order_depths[PRODUCTS]
+            orders: List[Order] = []
+            acceptable_price = """some call to fair value for specific product"""
+            print("Acceptable price : " + str(acceptable_price))
+            print("Buy Order Depth : " + str(len(order_depth.buy_orders)) + 
+                  ", Sell order depth : " + str(len(order_depth.sell_orders)))
+            
+            if len(order_depth.sell_orders) != 0:
+                best_ask, best_ask_amount = list(order_depth.sell_orders.items())[0]
+                if int(best_ask) < acceptable_price:
+                    print("BUY", str(-best_ask_amount) + "x", best_ask)
+            
+            if len(order_depth.buy_orders) != 0:
+                best_bid, best_bid_amount = list(order_depth.buy_orders.items())[0]
+                if int(best_bid) > acceptable_price:
+                    print("SELL", str(best_bid_amount) + "x", best_bid)
+                    orders.append(Order(product, best_bid, -best_bid_amount))
+
+            result[PRODUCTS] = orders
+
+
+
+        #orders: Dict[str, List[Order]] = {product: [] for product in PRODUCTS if product in state.order_depths}
+        #trader_state = self._decode_trader_data(state.traderData)
 
         order_depth = state.order_depths.get(EMERALDS)
         if order_depth is not None:

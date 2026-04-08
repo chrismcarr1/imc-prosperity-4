@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from math import ceil, floor
 from typing import Dict, List, Optional, Tuple
+from itertools import product
 
 try:
     from datamodel import Order, OrderDepth, TradingState
@@ -32,30 +33,30 @@ PRODUCTS = (EMERALDS, *TOMATOES_ALIASES)
 
 # Core market-making parameters.
 FAIR_VALUE = 10_000
-POSITION_LIMIT = 20
-BASE_HALF_SPREAD = 2
-MIN_EDGE = 1
-QUOTE_SIZE = 10
+POSITION_LIMIT = 30
+BASE_HALF_SPREAD = 3
+MIN_EDGE = 2
+QUOTE_SIZE = 12
 MAX_POSITION_UTILIZATION = 1.25
 
 # Inventory and microstructure adjustments.
 INVENTORY_SKEW_PER_UNIT = 0.12
-IMBALANCE_ADJUSTMENT = 1.0
+IMBALANCE_ADJUSTMENT = 1
 MAX_IMBALANCE_SHIFT = 1
 QUOTE_ADJUSTMENT = 2
 
 # Tomatoes market-making parameters.
-TOMATOES_POSITION_LIMIT = 20
-TOMATOES_QUOTE_SIZE = 5
-TOMATOES_BASE_HALF_SPREAD = 3
-TOMATOES_MIN_EDGE = 1
-TOMATOES_INVENTORY_SKEW_PER_UNIT = 0.10
-TOMATOES_FAIR_ALPHA = 0.18
+TOMATOES_POSITION_LIMIT = 30
+TOMATOES_QUOTE_SIZE = 12
+TOMATOES_BASE_HALF_SPREAD = 12.5
+TOMATOES_MIN_EDGE = 2
+TOMATOES_INVENTORY_SKEW_PER_UNIT = 0.15
+TOMATOES_FAIR_ALPHA = .18
 TOMATOES_TREND_WEIGHT = 0.25
-TOMATOES_MAX_TREND_SHIFT = 2.0
-TOMATOES_IMBALANCE_ADJUSTMENT = 0.35
+TOMATOES_MAX_TREND_SHIFT = 2.25
+TOMATOES_IMBALANCE_ADJUSTMENT = .2
 TOMATOES_MAX_IMBALANCE_SHIFT = 0.5
-TOMATOES_HISTORY_LENGTH = 8
+TOMATOES_HISTORY_LENGTH = 6
 
 # Listens to order book imbalance, but only between the lower and the minimum of upper/value
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -82,7 +83,8 @@ def compute_order_book_imbalance(bid_volume: Optional[int], ask_volume: Optional
 class Trader:
 
     def run(self, state: TradingState):
-        orders: Dict[str, List[Order]] = {product: [] for product in PRODUCTS if product in state.order_depths}
+        orders: Dict[str, List[Order]] = {product: [] for product in PRODUCTS 
+                                          if product in state.order_depths}
         trader_state = self._decode_trader_data(state.traderData)
 
         order_depth = state.order_depths.get(EMERALDS)
