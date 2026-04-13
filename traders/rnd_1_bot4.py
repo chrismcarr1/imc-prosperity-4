@@ -32,28 +32,28 @@ TOMATOES_ALIASES = (TOMATOES, "TOMATOE")
 
 FAIR_VALUE = 10_000
 POSITION_LIMIT = 20
-BASE_HALF_SPREAD = 9
-MIN_EDGE = 2
+BASE_HALF_SPREAD = 7
+MIN_EDGE = 1
 QUOTE_SIZE = 10
-INVENTORY_SKEW_PER_UNIT = 0.26
+INVENTORY_SKEW_PER_UNIT = 0.30
 IMBALANCE_ADJUSTMENT = 3.5
 MAX_IMBALANCE_SHIFT = 2
-QUOTE_ADJUSTMENT = 1.5
+QUOTE_ADJUSTMENT = 1.0
 TAKE_EDGE = 1.02
-SECOND_LEVEL_OFFSET = 2
+SECOND_LEVEL_OFFSET = 1
 SIGNAL_SIZE_BOOST = 5
 
 TOMATOES_POSITION_LIMIT = 30
 TOMATOES_QUOTE_SIZE = 12
 TOMATOES_BASE_HALF_SPREAD = 10.5
-TOMATOES_MIN_EDGE = 5.4
+TOMATOES_MIN_EDGE = 4.0
 TOMATOES_INVENTORY_SKEW_PER_UNIT = 0.13
-TOMATOES_FAIR_ALPHA = 0.09
+TOMATOES_FAIR_ALPHA = 0.12
 TOMATOES_TREND_WEIGHT = 0.36
 TOMATOES_MAX_TREND_SHIFT = 2.5
 TOMATOES_IMBALANCE_ADJUSTMENT = 0.35
 TOMATOES_MAX_IMBALANCE_SHIFT = 0.7
-TOMATOES_HISTORY_LENGTH = 8
+TOMATOES_HISTORY_LENGTH = 20
 TOMATOES_TAKE_EDGE = 1.2
 TOMATOES_SECOND_LEVEL_OFFSET = 3
 TOMATOES_SIGNAL_SIZE_BOOST = 8
@@ -96,6 +96,7 @@ class Product:
         self.order_depth = state.order_depths.get(symbol)
         self.orders: List[Order] = []
         self.pending_position = self.position
+        self.front_ratio = 0.65
 
     def best_bid_ask(self) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
         if self.order_depth is None:
@@ -164,8 +165,8 @@ class Product:
         signal_strength: float,
     ) -> None:
         buy_size, sell_size = self.conviction_adjusted_sizes(signal_strength)
-        front_buy = ceil(buy_size * 0.65)
-        front_sell = ceil(sell_size * 0.65)
+        front_buy = ceil(buy_size * self.front_ratio)
+        front_sell = ceil(sell_size * self.front_ratio)
         back_buy = buy_size - front_buy
         back_sell = sell_size - front_sell
 
@@ -194,6 +195,7 @@ class StaticProduct(Product):
             SIGNAL_SIZE_BOOST,
             SECOND_LEVEL_OFFSET,
         )
+        self.front_ratio = 0.75
 
     def fair_value(
         self,
