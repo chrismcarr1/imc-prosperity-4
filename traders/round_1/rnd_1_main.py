@@ -1,5 +1,3 @@
-#Top Performing Bot
-
 from dataclasses import dataclass, field
 import json
 from math import ceil, floor
@@ -34,33 +32,34 @@ INTARIAN_PEPPER_ROOT_ALIASES = (
     "PEPPER_ROOT",
 )
 
-FAIR_VALUE = 10_000
+OSMIUM_FAIR_VALUE = 10_000
 POSITION_LIMIT = 80
-BASE_HALF_SPREAD = 7
-MIN_EDGE = 1
-QUOTE_SIZE = 30
-INVENTORY_SKEW_PER_UNIT = 0.30
-IMBALANCE_ADJUSTMENT = 3.5
-MAX_IMBALANCE_SHIFT = 2
-QUOTE_ADJUSTMENT = 1.0
-TAKE_EDGE = 1.02
-SECOND_LEVEL_OFFSET = 1
-SIGNAL_SIZE_BOOST = 5
 
-TOMATOES_POSITION_LIMIT = 80
-TOMATOES_QUOTE_SIZE = 36
-TOMATOES_BASE_HALF_SPREAD = 10.5
-TOMATOES_MIN_EDGE = 4.0
-TOMATOES_INVENTORY_SKEW_PER_UNIT = 0.13
-TOMATOES_FAIR_ALPHA = 0.12
-TOMATOES_TREND_WEIGHT = 0.36
-TOMATOES_MAX_TREND_SHIFT = 2.5
-TOMATOES_IMBALANCE_ADJUSTMENT = 0.35
-TOMATOES_MAX_IMBALANCE_SHIFT = 0.7
-TOMATOES_HISTORY_LENGTH = 20
-TOMATOES_TAKE_EDGE = 1.2
-TOMATOES_SECOND_LEVEL_OFFSET = 3
-TOMATOES_SIGNAL_SIZE_BOOST = 8
+OSMIUM_QUOTE_SIZE = 20
+OSMIUM_BASE_HALF_SPREAD = 7
+OSMIUM_MIN_EDGE = 2
+OSMIUM_INVENTORY_SKEW_PER_UNIT = 0.1
+OSMIUM_TAKE_EDGE = .6
+OSMIUM_IMBALANCE_ADJUSTMENT = 1
+OSMIUM_MAX_IMBALANCE_SHIFT = 1.5
+OSMIUM_SIGNAL_SIZE_BOOST = 12
+OSMIUM_SECOND_LEVEL_OFFSET = 1
+
+DYNAMIC_QUOTE_SIZE = 18
+DYNAMIC_BASE_HALF_SPREAD = 6.5
+DYNAMIC_MIN_EDGE = 2
+DYNAMIC_INVENTORY_SKEW_PER_UNIT = 0
+DYNAMIC_TAKE_EDGE = 1.2
+DYNAMIC_SIGNAL_SIZE_BOOST = 16
+DYNAMIC_SECOND_LEVEL_OFFSET = 2
+DYNAMIC_HISTORY_LENGTH = 40
+DYNAMIC_FAST_ALPHA = 0.3
+DYNAMIC_SLOW_ALPHA = 0.06
+DYNAMIC_MICRO_ALPHA = 0.15
+DYNAMIC_TREND_WEIGHT = 0.95
+DYNAMIC_MAX_TREND_SHIFT = 6.0
+DYNAMIC_REVERSION_WEIGHT = 0.6
+DYNAMIC_MAX_REVERSION_SHIFT = 3
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -100,7 +99,7 @@ class Product:
         self.order_depth = state.order_depths.get(symbol)
         self.orders: List[Order] = []
         self.pending_position = self.position
-        self.front_ratio = 0.65
+        self.front_ratio = 0.7
 
     def best_bid_ask(self) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
         if self.order_depth is None:
@@ -150,15 +149,15 @@ class Product:
         conviction = clamp(signal_strength, 0.0, 1.0)
         boost = round(conviction * self.signal_size_boost)
         base_size = self.quote_size + boost
-        base_size = max(1, round(base_size * (1 - 0.35 * inventory_ratio)))
+        base_size = max(1, round(base_size * (1 - 0.45 * inventory_ratio)))
 
         buy_size = min(base_size, self.remaining_buy_capacity())
         sell_size = min(base_size, self.remaining_sell_capacity())
 
         if self.pending_position > 0:
-            buy_size = min(buy_size, max(1, base_size - ceil(abs(self.pending_position) / 4)))
+            buy_size = min(buy_size, max(1, base_size - ceil(abs(self.pending_position) / 10)))
         elif self.pending_position < 0:
-            sell_size = min(sell_size, max(1, base_size - ceil(abs(self.pending_position) / 4)))
+            sell_size = min(sell_size, max(1, base_size - ceil(abs(self.pending_position) / 10)))
 
         return max(0, buy_size), max(0, sell_size)
 
@@ -188,18 +187,18 @@ class Product:
         raise NotImplementedError
 
 
-class StaticProduct(Product):
+class OsmiumProduct(Product):
     def __init__(self, state: TradingState, trader_state: Dict[str, str]) -> None:
         super().__init__(
             ASH_COATED_OSMIUM,
             state,
             trader_state,
             POSITION_LIMIT,
-            QUOTE_SIZE,
-            SIGNAL_SIZE_BOOST,
-            SECOND_LEVEL_OFFSET,
+            OSMIUM_QUOTE_SIZE,
+            OSMIUM_SIGNAL_SIZE_BOOST,
+            OSMIUM_SECOND_LEVEL_OFFSET,
         )
-        self.front_ratio = 0.75
+        self.front_ratio = 0.78
 
     def fair_value(
         self,
@@ -208,25 +207,25 @@ class StaticProduct(Product):
         bid_volume: Optional[int],
         ask_volume: Optional[int],
     ) -> tuple[float, float]:
-        fair_value = float(FAIR_VALUE)
-
+        fair_value = float(OSMIUM_FAIR_VALUE)
         imbalance = compute_order_book_imbalance(bid_volume, ask_volume)
         imbalance_shift = clamp(
-            imbalance * IMBALANCE_ADJUSTMENT,
-            -MAX_IMBALANCE_SHIFT,
-            MAX_IMBALANCE_SHIFT,
+            imbalance * OSMIUM_IMBALANCE_ADJUSTMENT,
+            -OSMIUM_MAX_IMBALANCE_SHIFT,
+            OSMIUM_MAX_IMBALANCE_SHIFT,
         )
-        fair_value += imbalance_shift
 
-        if bid_price is not None and ask_price is not None:
+        if bid_price is not None and ask_price is not None and bid_price < ask_price:
             mid_price = (bid_price + ask_price) / 2
-            fair_value = 0.75 * fair_value + 0.25 * mid_price
+            fair_value = 0.85 * fair_value + 0.15 * mid_price
 
+        fair_value += imbalance_shift
         return fair_value, abs(imbalance)
 
     def take_liquidity(self, fair_value: float) -> None:
-        buy_threshold = fair_value - self.pending_position * INVENTORY_SKEW_PER_UNIT - TAKE_EDGE
-        sell_threshold = fair_value - self.pending_position * INVENTORY_SKEW_PER_UNIT + TAKE_EDGE
+        reservation_price = fair_value - self.pending_position * OSMIUM_INVENTORY_SKEW_PER_UNIT
+        buy_threshold = reservation_price - OSMIUM_TAKE_EDGE
+        sell_threshold = reservation_price + OSMIUM_TAKE_EDGE
 
         for ask_price, ask_volume in self.ordered_sells():
             if ask_price <= floor(buy_threshold):
@@ -246,26 +245,24 @@ class StaticProduct(Product):
         best_bid: Optional[int],
         best_ask: Optional[int],
     ) -> tuple[Optional[int], Optional[int]]:
-        inventory_shift = self.pending_position * INVENTORY_SKEW_PER_UNIT
-        reservation_price = fair_value - inventory_shift
-
-        bid_quote = floor(reservation_price - BASE_HALF_SPREAD)
-        ask_quote = ceil(reservation_price + BASE_HALF_SPREAD)
+        reservation_price = fair_value - self.pending_position * OSMIUM_INVENTORY_SKEW_PER_UNIT
+        bid_quote = floor(reservation_price - OSMIUM_BASE_HALF_SPREAD)
+        ask_quote = ceil(reservation_price + OSMIUM_BASE_HALF_SPREAD)
 
         if best_bid is not None:
-            bid_quote = max(bid_quote, best_bid + QUOTE_ADJUSTMENT)
+            bid_quote = max(bid_quote, best_bid + 1)
         if best_ask is not None:
-            ask_quote = min(ask_quote, best_ask - QUOTE_ADJUSTMENT)
+            ask_quote = min(ask_quote, best_ask - 1)
 
         if best_ask is not None:
-            bid_quote = min(bid_quote, best_ask - MIN_EDGE)
+            bid_quote = min(bid_quote, best_ask - OSMIUM_MIN_EDGE)
         if best_bid is not None:
-            ask_quote = max(ask_quote, best_bid + MIN_EDGE)
+            ask_quote = max(ask_quote, best_bid + OSMIUM_MIN_EDGE)
 
         if bid_quote >= ask_quote:
             center = round(reservation_price)
-            bid_quote = center - 1
-            ask_quote = center + 1
+            bid_quote = center - OSMIUM_MIN_EDGE
+            ask_quote = center + OSMIUM_MIN_EDGE
 
         return bid_quote, ask_quote
 
@@ -287,14 +284,14 @@ class DynamicProduct(Product):
             symbol,
             state,
             trader_state,
-            TOMATOES_POSITION_LIMIT,
-            TOMATOES_QUOTE_SIZE,
-            TOMATOES_SIGNAL_SIZE_BOOST,
-            TOMATOES_SECOND_LEVEL_OFFSET,
+            POSITION_LIMIT,
+            DYNAMIC_QUOTE_SIZE,
+            DYNAMIC_SIGNAL_SIZE_BOOST,
+            DYNAMIC_SECOND_LEVEL_OFFSET,
         )
 
     def parse_history(self) -> List[float]:
-        raw_history = self.trader_state.get("intarian_pepper_root", "")
+        raw_history = self.trader_state.get("dynamic", "")
         if not raw_history:
             return []
 
@@ -307,47 +304,55 @@ class DynamicProduct(Product):
         return prices
 
     def save_history(self, history: List[float]) -> None:
-        self.trader_state["intarian_pepper_root"] = ",".join(f"{price:.1f}" for price in history)
+        self.trader_state["dynamic"] = ",".join(f"{price:.1f}" for price in history)
+
+    def ema(self, history: List[float], alpha: float) -> float:
+        value = history[0]
+        for price in history[1:]:
+            value = (1 - alpha) * value + alpha * price
+        return value
 
     def fair_value(
         self,
         history: List[float],
+        best_bid: Optional[int],
+        best_ask: Optional[int],
         bid_volume: Optional[int],
         ask_volume: Optional[int],
     ) -> tuple[float, float]:
-        ema = history[0]
-        for price in history[1:]:
-            ema = (1 - TOMATOES_FAIR_ALPHA) * ema + TOMATOES_FAIR_ALPHA * price
+        slow_ema = self.ema(history, DYNAMIC_SLOW_ALPHA)
+        fast_ema = self.ema(history, DYNAMIC_FAST_ALPHA)
+        fair_value = 0.55 * fast_ema + 0.45 * slow_ema
 
-        trend_shift = 0.0
-        if len(history) >= 4:
-            recent = sum(history[-3:]) / 3
-            if len(history) >= 6:
-                previous = sum(history[-6:-3]) / 3
-            else:
-                previous = sum(history[:-3]) / max(1, len(history) - 3)
-            trend_shift = clamp(
-                (recent - previous) * TOMATOES_TREND_WEIGHT,
-                -TOMATOES_MAX_TREND_SHIFT,
-                TOMATOES_MAX_TREND_SHIFT,
-            )
+        if best_bid is not None and best_ask is not None and best_bid < best_ask:
+            micro_price = (
+                best_bid * (ask_volume or 0) + best_ask * (bid_volume or 0)
+            ) / max(1, (bid_volume or 0) + (ask_volume or 0))
+            fair_value = (1 - DYNAMIC_MICRO_ALPHA) * fair_value + DYNAMIC_MICRO_ALPHA * micro_price
 
-        imbalance = compute_order_book_imbalance(bid_volume, ask_volume)
-        imbalance_shift = clamp(
-            imbalance * TOMATOES_IMBALANCE_ADJUSTMENT,
-            -TOMATOES_MAX_IMBALANCE_SHIFT,
-            TOMATOES_MAX_IMBALANCE_SHIFT,
+        trend_shift = clamp(
+            (fast_ema - slow_ema) * DYNAMIC_TREND_WEIGHT,
+            -DYNAMIC_MAX_TREND_SHIFT,
+            DYNAMIC_MAX_TREND_SHIFT,
         )
+
+        anchor = sum(history[-12:]) / min(len(history), 12)
+        reversion_shift = clamp(
+            (anchor - fair_value) * DYNAMIC_REVERSION_WEIGHT,
+            -DYNAMIC_MAX_REVERSION_SHIFT,
+            DYNAMIC_MAX_REVERSION_SHIFT,
+        )
+
         signal_strength = max(
-            abs(trend_shift) / max(1e-9, TOMATOES_MAX_TREND_SHIFT),
-            abs(imbalance_shift) / max(1e-9, TOMATOES_MAX_IMBALANCE_SHIFT),
+            abs(trend_shift) / max(1e-9, DYNAMIC_MAX_TREND_SHIFT),
+            abs(reversion_shift) / max(1e-9, DYNAMIC_MAX_REVERSION_SHIFT),
         )
-        return ema + trend_shift + imbalance_shift, clamp(signal_strength, 0.0, 1.0)
+        return fair_value + trend_shift + reversion_shift, clamp(signal_strength, 0.0, 1.0)
 
     def take_liquidity(self, fair_value: float) -> None:
-        reservation_price = fair_value - self.pending_position * TOMATOES_INVENTORY_SKEW_PER_UNIT
-        buy_threshold = reservation_price - TOMATOES_TAKE_EDGE
-        sell_threshold = reservation_price + TOMATOES_TAKE_EDGE
+        reservation_price = fair_value - self.pending_position * DYNAMIC_INVENTORY_SKEW_PER_UNIT
+        buy_threshold = reservation_price - DYNAMIC_TAKE_EDGE
+        sell_threshold = reservation_price + DYNAMIC_TAKE_EDGE
 
         for ask_price, ask_volume in self.ordered_sells():
             if ask_price <= floor(buy_threshold):
@@ -368,12 +373,12 @@ class DynamicProduct(Product):
         best_ask: Optional[int],
         signal_strength: float,
     ) -> tuple[Optional[int], Optional[int]]:
-        inventory_shift = self.pending_position * TOMATOES_INVENTORY_SKEW_PER_UNIT
-        directional_push = signal_strength * 1.5
+        inventory_shift = self.pending_position * DYNAMIC_INVENTORY_SKEW_PER_UNIT
+        directional_push = signal_strength * 1.3
         reservation_price = fair_value - inventory_shift
 
-        bid_quote = floor(reservation_price - TOMATOES_BASE_HALF_SPREAD + directional_push)
-        ask_quote = ceil(reservation_price + TOMATOES_BASE_HALF_SPREAD - directional_push)
+        bid_quote = floor(reservation_price - DYNAMIC_BASE_HALF_SPREAD + directional_push)
+        ask_quote = ceil(reservation_price + DYNAMIC_BASE_HALF_SPREAD - directional_push)
 
         if best_bid is not None:
             bid_quote = max(bid_quote, best_bid + 1)
@@ -381,18 +386,14 @@ class DynamicProduct(Product):
             ask_quote = min(ask_quote, best_ask - 1)
 
         if best_ask is not None:
-            bid_quote = min(bid_quote, best_ask - TOMATOES_MIN_EDGE)
+            bid_quote = min(bid_quote, best_ask - DYNAMIC_MIN_EDGE)
         if best_bid is not None:
-            ask_quote = max(ask_quote, best_bid + TOMATOES_MIN_EDGE)
+            ask_quote = max(ask_quote, best_bid + DYNAMIC_MIN_EDGE)
 
         if bid_quote >= ask_quote:
             center = round(reservation_price)
-            bid_quote = center - 1
-            ask_quote = center + 1
-            if best_ask is not None:
-                bid_quote = min(bid_quote, best_ask - TOMATOES_MIN_EDGE)
-            if best_bid is not None:
-                ask_quote = max(ask_quote, best_bid + TOMATOES_MIN_EDGE)
+            bid_quote = center - DYNAMIC_MIN_EDGE
+            ask_quote = center + DYNAMIC_MIN_EDGE
 
         return bid_quote, ask_quote
 
@@ -402,17 +403,17 @@ class DynamicProduct(Product):
 
         if best_bid is not None and best_ask is not None and best_bid < best_ask:
             history.append((best_bid + best_ask) / 2)
-        history = history[-TOMATOES_HISTORY_LENGTH:]
+        history = history[-DYNAMIC_HISTORY_LENGTH:]
         self.save_history(history)
 
         if not history:
             return self.orders
 
-        fair_value, signal_strength = self.fair_value(history, bid_volume, ask_volume)
+        fair_value, signal_strength = self.fair_value(history, best_bid, best_ask, bid_volume, ask_volume)
         self.take_liquidity(fair_value)
 
         best_bid, bid_volume, best_ask, ask_volume = self.best_bid_ask()
-        fair_value, signal_strength = self.fair_value(history, bid_volume, ask_volume)
+        fair_value, signal_strength = self.fair_value(history, best_bid, best_ask, bid_volume, ask_volume)
         bid_quote, ask_quote = self.make_quotes(fair_value, best_bid, best_ask, signal_strength)
         self.quote_two_levels(bid_quote, ask_quote, signal_strength)
         return self.orders
@@ -459,10 +460,10 @@ class Trader:
         orders: Dict[str, List[Order]] = {}
 
         if ASH_COATED_OSMIUM in state.order_depths:
-            orders[ASH_COATED_OSMIUM] = StaticProduct(state, trader_state).build_orders()
+            orders[ASH_COATED_OSMIUM] = OsmiumProduct(state, trader_state).build_orders()
 
-        pepper_symbol = self.first_available_symbol(state.order_depths, INTARIAN_PEPPER_ROOT_ALIASES)
-        if pepper_symbol is not None:
-            orders[pepper_symbol] = DynamicProduct(pepper_symbol, state, trader_state).build_orders()
+        dynamic_symbol = self.first_available_symbol(state.order_depths, INTARIAN_PEPPER_ROOT_ALIASES)
+        if dynamic_symbol is not None:
+            orders[dynamic_symbol] = DynamicProduct(dynamic_symbol, state, trader_state).build_orders()
 
         return orders, 0, self.encode_trader_data(trader_state)
