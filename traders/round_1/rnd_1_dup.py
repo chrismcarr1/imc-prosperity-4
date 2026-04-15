@@ -40,8 +40,8 @@ OSMIUM_BASE_HALF_SPREAD = 7
 OSMIUM_MIN_EDGE = 2
 OSMIUM_INVENTORY_SKEW_PER_UNIT = 0.1
 OSMIUM_TAKE_EDGE = .6
-OSMIUM_IMBALANCE_ADJUSTMENT = 1
-OSMIUM_MAX_IMBALANCE_SHIFT = 1.5
+OSMIUM_IMBALANCE_ADJUSTMENT = 4
+OSMIUM_MAX_IMBALANCE_SHIFT = 4
 OSMIUM_SIGNAL_SIZE_BOOST = 12
 OSMIUM_SECOND_LEVEL_OFFSET = 1
 
@@ -217,7 +217,7 @@ class OsmiumProduct(Product):
 
         if bid_price is not None and ask_price is not None and bid_price < ask_price:
             mid_price = (bid_price + ask_price) / 2
-            fair_value = 0.85 * fair_value + 0.15 * mid_price
+            fair_value = 0.7 * fair_value + 0.3 * mid_price
 
         fair_value += imbalance_shift
         return fair_value, abs(imbalance)
