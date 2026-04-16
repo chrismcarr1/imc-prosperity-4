@@ -41,35 +41,32 @@ ASH_MIN_EDGE = 2
 ASH_INVENTORY_SKEW_PER_UNIT = 0.08
 ASH_TAKE_EDGE = 0.0
 ASH_IMBALANCE_ADJUSTMENT = 3.6
-ASH_MAX_IMBALANCE_SHIFT = 5.2
+ASH_MAX_IMBALANCE_SHIFT = 5.0
 ASH_SIGNAL_SIZE_BOOST = 16
 ASH_SECOND_LEVEL_OFFSET = 1
 
-ROOT_QUOTE_SIZE = 28
-ROOT_BASE_HALF_SPREAD = 4.3
-ROOT_MIN_EDGE = 1
+ROOT_QUOTE_SIZE = 24
+ROOT_BASE_HALF_SPREAD = 5.2
+ROOT_MIN_EDGE = 2
 ROOT_INVENTORY_SKEW_PER_UNIT = 0.0
-ROOT_TAKE_EDGE = 0.0
-ROOT_SIGNAL_SIZE_BOOST = 50
+ROOT_TAKE_EDGE = 0.25
+ROOT_SIGNAL_SIZE_BOOST = 42
 ROOT_SECOND_LEVEL_OFFSET = 1
 ROOT_HISTORY_LENGTH = 72
-ROOT_FAST_ALPHA = 0.40
-ROOT_MEDIUM_ALPHA = 0.20
+ROOT_FAST_ALPHA = 0.38
+ROOT_MEDIUM_ALPHA = 0.18
 ROOT_SLOW_ALPHA = 0.055
-ROOT_MICRO_ALPHA = 0.24
-ROOT_IMBALANCE_WEIGHT = 1.8
-ROOT_MAX_IMBALANCE_SHIFT = 3.2
-ROOT_TREND_WEIGHT = 1.45
-ROOT_MAX_TREND_SHIFT = 9.0
-ROOT_ACCEL_WEIGHT = 1.2
-ROOT_MAX_ACCEL_SHIFT = 4.5
-ROOT_REVERSION_WEIGHT = 0.55
-ROOT_MAX_REVERSION_SHIFT = 3.5
-ROOT_BREAKOUT_WEIGHT = 0.95
-ROOT_MAX_BREAKOUT_SHIFT = 4.0
-ROOT_NEAR_FAIR_TAKE = 1.4
-ROOT_TOP_LEVEL_MULTIPLIER = 1.15
-ROOT_POSITION_PANIC_MULTIPLIER = 1.45
+ROOT_MICRO_ALPHA = 0.22
+ROOT_IMBALANCE_WEIGHT = 1.6
+ROOT_MAX_IMBALANCE_SHIFT = 3.0
+ROOT_TREND_WEIGHT = 1.35
+ROOT_MAX_TREND_SHIFT = 8.5
+ROOT_ACCEL_WEIGHT = 1.15
+ROOT_MAX_ACCEL_SHIFT = 4.0
+ROOT_REVERSION_WEIGHT = 0.7
+ROOT_MAX_REVERSION_SHIFT = 4.0
+ROOT_BREAKOUT_WEIGHT = 0.8
+ROOT_MAX_BREAKOUT_SHIFT = 3.5
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -284,7 +281,7 @@ class StableProduct(Product):
         return self.orders
 
 
-class ManiacPepperProduct(Product):
+class AggressivePepperProduct(Product):
     def __init__(self, symbol: str, state: TradingState, trader_state: Dict[str, object]) -> None:
         super().__init__(
             symbol,
@@ -442,58 +439,31 @@ class ManiacPepperProduct(Product):
         signal_strength: float,
         alpha: float,
         realized_vol: float,
-        best_bid: Optional[int],
-        best_ask: Optional[int],
     ) -> None:
         inv_ratio = self.inventory_ratio()
-        spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else 10
-        fair_edge = ROOT_NEAR_FAIR_TAKE + 0.2 * realized_vol + 0.3 * max(0, spread - 4)
+        buy_edge = max(0.0, ROOT_TAKE_EDGE - 0.55 * max(alpha, 0.0) + 0.12 * realized_vol)
+        sell_edge = max(0.0, ROOT_TAKE_EDGE - 0.35 * max(-alpha, 0.0) + 0.12 * realized_vol)
 
-        buy_threshold = fair_value + fair_edge + 0.9 * max(alpha, 0.0)
-        sell_threshold = fair_value - fair_edge + 0.9 * min(alpha, 0.0)
+        long_unwind_discount = 2.1 * inv_ratio + 1.5 * max(-alpha, 0.0)
+        short_cover_bonus = 2.1 * inv_ratio + 1.5 * max(alpha, 0.0)
 
-        if self.pending_position < 0:
-            buy_threshold += 1.4 + 2.0 * inv_ratio
-        elif self.pending_position > 0:
-            sell_threshold -= 1.4 + 2.0 * inv_ratio
+        buy_threshold = fair_value - buy_edge + short_cover_bonus * (1 if self.pending_position < 0 else 0)
+        sell_threshold = fair_value + sell_edge - long_unwind_discount * (1 if self.pending_position > 0 else 0)
 
-        sweep_cap = round((self.quote_size + signal_strength * self.signal_size_boost) * ROOT_TOP_LEVEL_MULTIPLIER)
-        if inv_ratio > 0.45:
-            sweep_cap = round(sweep_cap * ROOT_POSITION_PANIC_MULTIPLIER)
+        take_buy_cap = max(0, round(self.quote_size + signal_strength * self.signal_size_boost * 0.8))
+        take_sell_cap = max(0, round(self.quote_size + signal_strength * self.signal_size_boost * 0.8))
 
         bought = 0
-        for level, (ask_price, ask_volume) in enumerate(self.ordered_sells()):
-            if bought >= sweep_cap:
-                break
-            acceptable = ask_price <= floor(buy_threshold)
-            chase = (
-                level == 0
-                and best_bid is not None
-                and best_ask is not None
-                and spread <= 6
-                and ask_price <= ceil(fair_value + ROOT_NEAR_FAIR_TAKE + max(alpha, 0.0))
-            )
-            if acceptable or chase:
-                size = ask_volume if level == 0 else min(ask_volume, max(4, sweep_cap - bought))
-                bought += self.add_buy(ask_price, min(size, sweep_cap - bought))
+        for ask_price, ask_volume in self.ordered_sells():
+            if ask_price <= floor(buy_threshold) and bought < take_buy_cap:
+                bought += self.add_buy(ask_price, min(ask_volume, take_buy_cap - bought))
             else:
                 break
 
         sold = 0
-        for level, (bid_price, bid_volume) in enumerate(self.ordered_buys()):
-            if sold >= sweep_cap:
-                break
-            acceptable = bid_price >= ceil(sell_threshold)
-            chase = (
-                level == 0
-                and best_bid is not None
-                and best_ask is not None
-                and spread <= 6
-                and bid_price >= floor(fair_value - ROOT_NEAR_FAIR_TAKE + min(alpha, 0.0))
-            )
-            if acceptable or chase:
-                size = bid_volume if level == 0 else min(bid_volume, max(4, sweep_cap - sold))
-                sold += self.add_sell(bid_price, min(size, sweep_cap - sold))
+        for bid_price, bid_volume in self.ordered_buys():
+            if bid_price >= ceil(sell_threshold) and sold < take_sell_cap:
+                sold += self.add_sell(bid_price, min(bid_volume, take_sell_cap - sold))
             else:
                 break
 
@@ -508,29 +478,21 @@ class ManiacPepperProduct(Product):
         best_ask: Optional[int],
     ) -> tuple[Optional[int], Optional[int], int, int, float, float]:
         inv_ratio = self.inventory_ratio()
+        compression = clamp((avg_spread - 8.0) / 8.0, -0.5, 1.0)
         half_spread = clamp(
-            ROOT_BASE_HALF_SPREAD + 0.25 * realized_vol - 1.0 * signal_strength - 0.45 * max(0.0, (avg_spread - 6) / 6),
-            2.0,
-            6.0,
+            ROOT_BASE_HALF_SPREAD + 0.35 * realized_vol - 1.2 * signal_strength - 0.6 * compression,
+            3.0,
+            8.0,
         )
 
         reservation_price = fair_value
-        bid_quote = floor(reservation_price - half_spread + 0.35 * max(alpha, 0.0))
-        ask_quote = ceil(reservation_price + half_spread + 0.35 * min(alpha, 0.0))
+        bid_quote = floor(reservation_price - half_spread + 0.25 * max(alpha, 0.0))
+        ask_quote = ceil(reservation_price + half_spread + 0.25 * min(alpha, 0.0))
 
-        if best_bid is not None and best_ask is not None:
-            spread = best_ask - best_bid
-            if spread <= 3:
-                bid_quote = max(bid_quote, best_bid)
-                ask_quote = min(ask_quote, best_ask)
-            else:
-                bid_quote = max(bid_quote, best_bid + 1)
-                ask_quote = min(ask_quote, best_ask - 1)
-
-            if alpha > 1.2:
-                bid_quote = max(bid_quote, best_ask - 1)
-            elif alpha < -1.2:
-                ask_quote = min(ask_quote, best_bid + 1)
+        if best_bid is not None:
+            bid_quote = max(bid_quote, best_bid + 1)
+        if best_ask is not None:
+            ask_quote = min(ask_quote, best_ask - 1)
 
         if best_ask is not None:
             bid_quote = min(bid_quote, best_ask - ROOT_MIN_EDGE)
@@ -538,42 +500,49 @@ class ManiacPepperProduct(Product):
             ask_quote = max(ask_quote, best_bid + ROOT_MIN_EDGE)
 
         if self.pending_position > 0:
-            ask_quote -= ceil(1.0 + 4.8 * inv_ratio + 0.9 * max(-alpha, 0.0))
+            ask_quote -= ceil(1.5 + 4.0 * inv_ratio + 1.2 * max(-alpha, 0.0))
             if best_bid is not None:
                 ask_quote = max(best_bid + 1, ask_quote)
-        elif self.pending_position < 0:
-            bid_quote += ceil(1.0 + 4.8 * inv_ratio + 0.9 * max(alpha, 0.0))
+            if best_ask is not None:
+                ask_quote = min(best_ask, ask_quote)
+
+        if self.pending_position < 0:
+            bid_quote += ceil(1.5 + 4.0 * inv_ratio + 1.2 * max(alpha, 0.0))
             if best_ask is not None:
                 bid_quote = min(best_ask - 1, bid_quote)
+            if best_bid is not None:
+                bid_quote = max(best_bid, bid_quote)
 
         if bid_quote >= ask_quote:
             center = round(reservation_price)
             bid_quote = center - ROOT_MIN_EDGE
             ask_quote = center + ROOT_MIN_EDGE
 
-        base_size = max(8, round((self.quote_size + signal_strength * self.signal_size_boost) * (1 - 0.18 * inv_ratio)))
+        base_size = max(5, round((self.quote_size + signal_strength * self.signal_size_boost) * (1 - 0.25 * inv_ratio)))
         buy_size = min(base_size, self.remaining_buy_capacity())
         sell_size = min(base_size, self.remaining_sell_capacity())
 
         if alpha > 0:
-            buy_size = min(self.remaining_buy_capacity(), round(buy_size * (1.18 + 0.65 * signal_strength)))
-            sell_size = min(self.remaining_sell_capacity(), round(sell_size * (1.05 + 0.45 * inv_ratio)))
+            buy_size = min(self.remaining_buy_capacity(), round(buy_size * (1.15 + 0.5 * signal_strength)))
+            if self.pending_position > 0:
+                sell_size = min(self.remaining_sell_capacity(), round(sell_size * (1.1 + 0.5 * inv_ratio)))
         elif alpha < 0:
-            sell_size = min(self.remaining_sell_capacity(), round(sell_size * (1.18 + 0.65 * signal_strength)))
-            buy_size = min(self.remaining_buy_capacity(), round(buy_size * (1.05 + 0.45 * inv_ratio)))
+            sell_size = min(self.remaining_sell_capacity(), round(sell_size * (1.15 + 0.5 * signal_strength)))
+            if self.pending_position < 0:
+                buy_size = min(self.remaining_buy_capacity(), round(buy_size * (1.1 + 0.5 * inv_ratio)))
 
         if self.pending_position > 0:
-            sell_size = min(self.remaining_sell_capacity(), round(max(sell_size, base_size * (1.15 + 1.4 * inv_ratio))))
+            sell_size = min(self.remaining_sell_capacity(), round(max(sell_size, base_size * (1.0 + 1.25 * inv_ratio))))
         elif self.pending_position < 0:
-            buy_size = min(self.remaining_buy_capacity(), round(max(buy_size, base_size * (1.15 + 1.4 * inv_ratio))))
+            buy_size = min(self.remaining_buy_capacity(), round(max(buy_size, base_size * (1.0 + 1.25 * inv_ratio))))
 
-        buy_front = clamp(0.86 + 0.06 * max(alpha, 0.0), 0.78, 0.98)
-        sell_front = clamp(0.86 + 0.06 * max(-alpha, 0.0), 0.78, 0.98)
+        buy_front = clamp(0.68 + 0.15 * max(alpha, 0.0), 0.58, 0.92)
+        sell_front = clamp(0.68 + 0.15 * max(-alpha, 0.0), 0.58, 0.92)
 
         if self.pending_position > 0:
-            sell_front = clamp(sell_front + 0.08 + 0.08 * inv_ratio, 0.80, 0.99)
+            sell_front = clamp(sell_front + 0.12 + 0.1 * inv_ratio, 0.58, 0.97)
         elif self.pending_position < 0:
-            buy_front = clamp(buy_front + 0.08 + 0.08 * inv_ratio, 0.80, 0.99)
+            buy_front = clamp(buy_front + 0.12 + 0.1 * inv_ratio, 0.58, 0.97)
 
         return bid_quote, ask_quote, buy_size, sell_size, buy_front, sell_front
 
@@ -591,9 +560,9 @@ class ManiacPepperProduct(Product):
             bid_volume,
             ask_volume,
         )
-        self.take_liquidity(fair_value, signal_strength, alpha, realized_vol, best_bid, best_ask)
+        self.take_liquidity(fair_value, signal_strength, alpha, realized_vol)
 
-        best_bid, _, best_ask, _ = self.best_bid_ask()
+        best_bid, bid_volume, best_ask, ask_volume = self.best_bid_ask()
         bid_quote, ask_quote, buy_size, sell_size, buy_front, sell_front = self.make_quotes(
             fair_value,
             signal_strength,
@@ -659,6 +628,6 @@ class Trader:
 
         dynamic_symbol = self.first_available_symbol(state.order_depths, INTARIAN_PEPPER_ROOT_ALIASES)
         if dynamic_symbol is not None:
-            orders[dynamic_symbol] = ManiacPepperProduct(dynamic_symbol, state, trader_state).build_orders()
+            orders[dynamic_symbol] = AggressivePepperProduct(dynamic_symbol, state, trader_state).build_orders()
 
         return orders, 0, self.encode_trader_data(trader_state)
