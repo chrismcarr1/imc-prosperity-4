@@ -35,38 +35,31 @@ INTARIAN_PEPPER_ROOT_ALIASES = (
 ASH_FAIR_VALUE = 10_000
 POSITION_LIMIT = 80
 
-ASH_QUOTE_SIZE = 24
-ASH_BASE_HALF_SPREAD = 9
+ASH_QUOTE_SIZE = 20
+ASH_BASE_HALF_SPREAD = 11
 ASH_MIN_EDGE = 2
-ASH_INVENTORY_SKEW_PER_UNIT = 0.08
-ASH_TAKE_EDGE = 0.0
-ASH_IMBALANCE_ADJUSTMENT = 3.6
-ASH_MAX_IMBALANCE_SHIFT = 5.0
-ASH_SIGNAL_SIZE_BOOST = 16
+ASH_INVENTORY_SKEW_PER_UNIT = 0.1
+ASH_TAKE_EDGE = .4
+ASH_IMBALANCE_ADJUSTMENT = 2.5
+ASH_MAX_IMBALANCE_SHIFT = 4
+ASH_SIGNAL_SIZE_BOOST = 12
 ASH_SECOND_LEVEL_OFFSET = 1
 
-ROOT_QUOTE_SIZE = 24
-ROOT_BASE_HALF_SPREAD = 5.2
-ROOT_MIN_EDGE = 2
-ROOT_INVENTORY_SKEW_PER_UNIT = 0.0
-ROOT_TAKE_EDGE = 0.25
-ROOT_SIGNAL_SIZE_BOOST = 42
-ROOT_SECOND_LEVEL_OFFSET = 1
-ROOT_HISTORY_LENGTH = 72
-ROOT_FAST_ALPHA = 0.38
-ROOT_MEDIUM_ALPHA = 0.18
-ROOT_SLOW_ALPHA = 0.055
-ROOT_MICRO_ALPHA = 0.22
-ROOT_IMBALANCE_WEIGHT = 1.6
-ROOT_MAX_IMBALANCE_SHIFT = 3.0
-ROOT_TREND_WEIGHT = 1.35
-ROOT_MAX_TREND_SHIFT = 8.5
-ROOT_ACCEL_WEIGHT = 1.15
-ROOT_MAX_ACCEL_SHIFT = 4.0
-ROOT_REVERSION_WEIGHT = 0.7
-ROOT_MAX_REVERSION_SHIFT = 4.0
-ROOT_BREAKOUT_WEIGHT = 0.8
-ROOT_MAX_BREAKOUT_SHIFT = 3.5
+ROOT_QUOTE_SIZE = 18
+ROOT_BASE_HALF_SPREAD = 8.5
+ROOT_MIN_EDGE = 6
+ROOT_INVENTORY_SKEW_PER_UNIT = 0
+ROOT_TAKE_EDGE = 1
+ROOT_SIGNAL_SIZE_BOOST = 30
+ROOT_SECOND_LEVEL_OFFSET = 2
+ROOT_HISTORY_LENGTH = 45
+ROOT_FAST_ALPHA = 0.3
+ROOT_SLOW_ALPHA = 0.06
+ROOT_MICRO_ALPHA = 0.15
+ROOT_TREND_WEIGHT = 0.95
+ROOT_MAX_TREND_SHIFT = 6.0
+ROOT_REVERSION_WEIGHT = 0.6
+ROOT_MAX_REVERSION_SHIFT = 3
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -89,7 +82,7 @@ class Product:
         self,
         symbol: str,
         state: TradingState,
-        trader_state: Dict[str, object],
+        trader_state: Dict[str, str],
         position_limit: int,
         quote_size: int,
         signal_size_boost: int,
@@ -106,7 +99,7 @@ class Product:
         self.order_depth = state.order_depths.get(symbol)
         self.orders: List[Order] = []
         self.pending_position = self.position
-        self.front_ratio = 0.74
+        self.front_ratio = 0.7
 
     def best_bid_ask(self) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
         if self.order_depth is None:
@@ -148,26 +141,36 @@ class Product:
             self.pending_position -= size
         return size
 
-    def inventory_ratio(self) -> float:
-        if self.position_limit <= 0:
-            return 0.0
-        return abs(self.pending_position) / self.position_limit
+    def conviction_adjusted_sizes(self, signal_strength: float) -> tuple[int, int]:
+        inventory_ratio = 0.0
+        if self.position_limit > 0:
+            inventory_ratio = abs(self.pending_position) / self.position_limit
+
+        conviction = clamp(signal_strength, 0.0, 1.0)
+        boost = round(conviction * self.signal_size_boost)
+        base_size = self.quote_size + boost
+        base_size = max(1, round(base_size * (1 - 0.45 * inventory_ratio)))
+
+        buy_size = min(base_size, self.remaining_buy_capacity())
+        sell_size = min(base_size, self.remaining_sell_capacity())
+
+        if self.pending_position > 0:
+            buy_size = min(buy_size, max(1, base_size - ceil(abs(self.pending_position) / 10)))
+        elif self.pending_position < 0:
+            sell_size = min(sell_size, max(1, base_size - ceil(abs(self.pending_position) / 10)))
+
+        return max(0, buy_size), max(0, sell_size)
 
     def quote_two_levels(
         self,
         bid_quote: Optional[int],
         ask_quote: Optional[int],
-        bid_size: int,
-        sell_size: int,
-        front_ratio_buy: Optional[float] = None,
-        front_ratio_sell: Optional[float] = None,
+        signal_strength: float,
     ) -> None:
-        use_front_buy = clamp(front_ratio_buy if front_ratio_buy is not None else self.front_ratio, 0.45, 1.0)
-        use_front_sell = clamp(front_ratio_sell if front_ratio_sell is not None else self.front_ratio, 0.45, 1.0)
-
-        front_buy = ceil(bid_size * use_front_buy)
-        front_sell = ceil(sell_size * use_front_sell)
-        back_buy = bid_size - front_buy
+        buy_size, sell_size = self.conviction_adjusted_sizes(signal_strength)
+        front_buy = ceil(buy_size * self.front_ratio)
+        front_sell = ceil(sell_size * self.front_ratio)
+        back_buy = buy_size - front_buy
         back_sell = sell_size - front_sell
 
         if bid_quote is not None and front_buy > 0:
@@ -185,7 +188,7 @@ class Product:
 
 
 class StableProduct(Product):
-    def __init__(self, state: TradingState, trader_state: Dict[str, object]) -> None:
+    def __init__(self, state: TradingState, trader_state: Dict[str, str]) -> None:
         super().__init__(
             ASH_COATED_OSMIUM,
             state,
@@ -195,7 +198,7 @@ class StableProduct(Product):
             ASH_SIGNAL_SIZE_BOOST,
             ASH_SECOND_LEVEL_OFFSET,
         )
-        self.front_ratio = 0.82
+        self.front_ratio = 0.78
 
     def fair_value(
         self,
@@ -213,7 +216,8 @@ class StableProduct(Product):
         )
 
         if bid_price is not None and ask_price is not None and bid_price < ask_price:
-            fair_value = 0.6 * fair_value + 0.4 * ((bid_price + ask_price) / 2)
+            mid_price = (bid_price + ask_price) / 2
+            fair_value = 0.7 * fair_value + 0.3 * mid_price
 
         fair_value += imbalance_shift
         return fair_value, abs(imbalance)
@@ -240,12 +244,10 @@ class StableProduct(Product):
         fair_value: float,
         best_bid: Optional[int],
         best_ask: Optional[int],
-        signal_strength: float,
-    ) -> tuple[Optional[int], Optional[int], int, int]:
+    ) -> tuple[Optional[int], Optional[int]]:
         reservation_price = fair_value - self.pending_position * ASH_INVENTORY_SKEW_PER_UNIT
-        half_spread = ASH_BASE_HALF_SPREAD - 1.5 * signal_strength
-        bid_quote = floor(reservation_price - half_spread)
-        ask_quote = ceil(reservation_price + half_spread)
+        bid_quote = floor(reservation_price - ASH_BASE_HALF_SPREAD)
+        ask_quote = ceil(reservation_price + ASH_BASE_HALF_SPREAD)
 
         if best_bid is not None:
             bid_quote = max(bid_quote, best_bid + 1)
@@ -262,12 +264,7 @@ class StableProduct(Product):
             bid_quote = center - ASH_MIN_EDGE
             ask_quote = center + ASH_MIN_EDGE
 
-        inv = self.inventory_ratio()
-        boost = round(signal_strength * self.signal_size_boost)
-        base_size = max(4, round((self.quote_size + boost) * (1 - 0.35 * inv)))
-        buy_size = min(base_size, self.remaining_buy_capacity())
-        sell_size = min(base_size, self.remaining_sell_capacity())
-        return bid_quote, ask_quote, buy_size, sell_size
+        return bid_quote, ask_quote
 
     def build_orders(self) -> List[Order]:
         best_bid, bid_volume, best_ask, ask_volume = self.best_bid_ask()
@@ -276,13 +273,13 @@ class StableProduct(Product):
 
         best_bid, bid_volume, best_ask, ask_volume = self.best_bid_ask()
         fair_value, signal_strength = self.fair_value(best_bid, best_ask, bid_volume, ask_volume)
-        bid_quote, ask_quote, buy_size, sell_size = self.make_quotes(fair_value, best_bid, best_ask, signal_strength)
-        self.quote_two_levels(bid_quote, ask_quote, buy_size, sell_size)
+        bid_quote, ask_quote = self.make_quotes(fair_value, best_bid, best_ask)
+        self.quote_two_levels(bid_quote, ask_quote, signal_strength)
         return self.orders
 
 
-class AggressivePepperProduct(Product):
-    def __init__(self, symbol: str, state: TradingState, trader_state: Dict[str, object]) -> None:
+class DynamicProduct(Product):
+    def __init__(self, symbol: str, state: TradingState, trader_state: Dict[str, str]) -> None:
         super().__init__(
             symbol,
             state,
@@ -293,32 +290,21 @@ class AggressivePepperProduct(Product):
             ROOT_SECOND_LEVEL_OFFSET,
         )
 
-    def _load_series(self, key: str) -> List[float]:
-        raw = self.trader_state.get(key, [])
-        if isinstance(raw, list):
-            result: List[float] = []
-            for value in raw:
-                try:
-                    result.append(float(value))
-                except (TypeError, ValueError):
-                    continue
-            return result
+    def parse_history(self) -> List[float]:
+        raw_history = self.trader_state.get("dynamic", "")
+        if not raw_history:
+            return []
 
-        if isinstance(raw, str):
-            values: List[float] = []
-            for item in raw.split(","):
-                if not item:
-                    continue
-                try:
-                    values.append(float(item))
-                except ValueError:
-                    continue
-            return values
+        prices: List[float] = []
+        for value in raw_history.split(","):
+            try:
+                prices.append(float(value))
+            except ValueError:
+                continue
+        return prices
 
-        return []
-
-    def _save_series(self, key: str, values: List[float]) -> None:
-        self.trader_state[key] = [round(value, 3) for value in values[-ROOT_HISTORY_LENGTH:]]
+    def save_history(self, history: List[float]) -> None:
+        self.trader_state["dynamic"] = ",".join(f"{price:.1f}" for price in history)
 
     def ema(self, history: List[float], alpha: float) -> float:
         value = history[0]
@@ -326,168 +312,73 @@ class AggressivePepperProduct(Product):
             value = (1 - alpha) * value + alpha * price
         return value
 
-    def mean_abs_diff(self, history: List[float], window: int) -> float:
-        if len(history) < 2:
-            return 0.0
-        diffs = [abs(history[i] - history[i - 1]) for i in range(max(1, len(history) - window), len(history))]
-        if not diffs:
-            return 0.0
-        return sum(diffs) / len(diffs)
-
-    def collect_state(
-        self,
-        best_bid: Optional[int],
-        bid_volume: Optional[int],
-        best_ask: Optional[int],
-        ask_volume: Optional[int],
-    ) -> tuple[List[float], List[float]]:
-        prices = self._load_series(f"{self.symbol}_prices")
-        spreads = self._load_series(f"{self.symbol}_spreads")
-
-        if best_bid is not None and best_ask is not None and best_bid < best_ask:
-            prices.append((best_bid + best_ask) / 2)
-            spreads.append(float(best_ask - best_bid))
-        elif best_bid is not None:
-            prices.append(float(best_bid))
-        elif best_ask is not None:
-            prices.append(float(best_ask))
-
-        prices = prices[-ROOT_HISTORY_LENGTH:]
-        spreads = spreads[-ROOT_HISTORY_LENGTH:]
-        self._save_series(f"{self.symbol}_prices", prices)
-        self._save_series(f"{self.symbol}_spreads", spreads)
-        return prices, spreads
-
     def fair_value(
         self,
         history: List[float],
-        spreads: List[float],
         best_bid: Optional[int],
         best_ask: Optional[int],
         bid_volume: Optional[int],
         ask_volume: Optional[int],
-    ) -> tuple[float, float, float, float, float]:
-        fast_ema = self.ema(history, ROOT_FAST_ALPHA)
-        medium_ema = self.ema(history, ROOT_MEDIUM_ALPHA)
+    ) -> tuple[float, float]:
         slow_ema = self.ema(history, ROOT_SLOW_ALPHA)
-        base_fair = 0.5 * fast_ema + 0.3 * medium_ema + 0.2 * slow_ema
+        fast_ema = self.ema(history, ROOT_FAST_ALPHA)
+        fair_value = 0.55 * fast_ema + 0.45 * slow_ema
 
-        current_mid = history[-1]
-        avg_spread = sum(spreads[-20:]) / max(1, min(len(spreads), 20)) if spreads else 12.0
-        realized_vol = self.mean_abs_diff(history, 14)
-
-        imbalance = compute_order_book_imbalance(bid_volume, ask_volume)
-        imbalance_shift = clamp(
-            imbalance * ROOT_IMBALANCE_WEIGHT,
-            -ROOT_MAX_IMBALANCE_SHIFT,
-            ROOT_MAX_IMBALANCE_SHIFT,
-        )
-
-        micro_shift = 0.0
         if best_bid is not None and best_ask is not None and best_bid < best_ask:
             micro_price = (
                 best_bid * (ask_volume or 0) + best_ask * (bid_volume or 0)
             ) / max(1, (bid_volume or 0) + (ask_volume or 0))
-            micro_shift = (micro_price - base_fair) * ROOT_MICRO_ALPHA
+            fair_value = (1 - ROOT_MICRO_ALPHA) * fair_value + ROOT_MICRO_ALPHA * micro_price
 
         trend_shift = clamp(
             (fast_ema - slow_ema) * ROOT_TREND_WEIGHT,
             -ROOT_MAX_TREND_SHIFT,
             ROOT_MAX_TREND_SHIFT,
         )
-        accel_raw = 0.0
-        if len(history) >= 8:
-            accel_raw = (history[-1] - history[-4]) - (history[-4] - history[-7])
-        accel_shift = clamp(
-            accel_raw * ROOT_ACCEL_WEIGHT,
-            -ROOT_MAX_ACCEL_SHIFT,
-            ROOT_MAX_ACCEL_SHIFT,
-        )
 
-        anchor = sum(history[-10:]) / min(len(history), 10)
+        anchor = sum(history[-12:]) / min(len(history), 12)
         reversion_shift = clamp(
-            (anchor - current_mid) * ROOT_REVERSION_WEIGHT,
+            (anchor - fair_value) * ROOT_REVERSION_WEIGHT,
             -ROOT_MAX_REVERSION_SHIFT,
             ROOT_MAX_REVERSION_SHIFT,
         )
 
-        breakout_shift = 0.0
-        if len(history) >= 12:
-            breakout = current_mid - max(history[-12:-1])
-            breakdown = current_mid - min(history[-12:-1])
-            if breakout > 0:
-                breakout_shift = clamp(breakout * ROOT_BREAKOUT_WEIGHT, 0.0, ROOT_MAX_BREAKOUT_SHIFT)
-            elif breakdown < 0:
-                breakout_shift = clamp(breakdown * ROOT_BREAKOUT_WEIGHT, -ROOT_MAX_BREAKOUT_SHIFT, 0.0)
-
-        fair_value = base_fair + micro_shift + imbalance_shift + trend_shift + accel_shift + reversion_shift + breakout_shift
-        signal_strength = clamp(
-            (
-                abs(trend_shift) / ROOT_MAX_TREND_SHIFT
-                + abs(accel_shift) / ROOT_MAX_ACCEL_SHIFT
-                + abs(breakout_shift) / max(1e-9, ROOT_MAX_BREAKOUT_SHIFT)
-            ) / 3,
-            0.0,
-            1.0,
+        signal_strength = max(
+            abs(trend_shift) / max(1e-9, ROOT_MAX_TREND_SHIFT),
+            abs(reversion_shift) / max(1e-9, ROOT_MAX_REVERSION_SHIFT),
         )
-        alpha = fair_value - current_mid
-        return fair_value, signal_strength, alpha, realized_vol, avg_spread
+        return fair_value + trend_shift + reversion_shift, clamp(signal_strength, 0.0, 1.0)
 
-    def take_liquidity(
-        self,
-        fair_value: float,
-        signal_strength: float,
-        alpha: float,
-        realized_vol: float,
-    ) -> None:
-        inv_ratio = self.inventory_ratio()
-        buy_edge = max(0.0, ROOT_TAKE_EDGE - 0.55 * max(alpha, 0.0) + 0.12 * realized_vol)
-        sell_edge = max(0.0, ROOT_TAKE_EDGE - 0.35 * max(-alpha, 0.0) + 0.12 * realized_vol)
+    def take_liquidity(self, fair_value: float) -> None:
+        reservation_price = fair_value - self.pending_position * ROOT_INVENTORY_SKEW_PER_UNIT
+        buy_threshold = reservation_price - ROOT_TAKE_EDGE
+        sell_threshold = reservation_price + ROOT_TAKE_EDGE
 
-        long_unwind_discount = 2.1 * inv_ratio + 1.5 * max(-alpha, 0.0)
-        short_cover_bonus = 2.1 * inv_ratio + 1.5 * max(alpha, 0.0)
-
-        buy_threshold = fair_value - buy_edge + short_cover_bonus * (1 if self.pending_position < 0 else 0)
-        sell_threshold = fair_value + sell_edge - long_unwind_discount * (1 if self.pending_position > 0 else 0)
-
-        take_buy_cap = max(0, round(self.quote_size + signal_strength * self.signal_size_boost * 0.8))
-        take_sell_cap = max(0, round(self.quote_size + signal_strength * self.signal_size_boost * 0.8))
-
-        bought = 0
         for ask_price, ask_volume in self.ordered_sells():
-            if ask_price <= floor(buy_threshold) and bought < take_buy_cap:
-                bought += self.add_buy(ask_price, min(ask_volume, take_buy_cap - bought))
+            if ask_price <= floor(buy_threshold):
+                self.add_buy(ask_price, ask_volume)
             else:
                 break
 
-        sold = 0
         for bid_price, bid_volume in self.ordered_buys():
-            if bid_price >= ceil(sell_threshold) and sold < take_sell_cap:
-                sold += self.add_sell(bid_price, min(bid_volume, take_sell_cap - sold))
+            if bid_price >= ceil(sell_threshold):
+                self.add_sell(bid_price, bid_volume)
             else:
                 break
 
     def make_quotes(
         self,
         fair_value: float,
-        signal_strength: float,
-        alpha: float,
-        realized_vol: float,
-        avg_spread: float,
         best_bid: Optional[int],
         best_ask: Optional[int],
-    ) -> tuple[Optional[int], Optional[int], int, int, float, float]:
-        inv_ratio = self.inventory_ratio()
-        compression = clamp((avg_spread - 8.0) / 8.0, -0.5, 1.0)
-        half_spread = clamp(
-            ROOT_BASE_HALF_SPREAD + 0.35 * realized_vol - 1.2 * signal_strength - 0.6 * compression,
-            3.0,
-            8.0,
-        )
+        signal_strength: float,
+    ) -> tuple[Optional[int], Optional[int]]:
+        inventory_shift = self.pending_position * ROOT_INVENTORY_SKEW_PER_UNIT
+        directional_push = signal_strength * 1.3
+        reservation_price = fair_value - inventory_shift
 
-        reservation_price = fair_value
-        bid_quote = floor(reservation_price - half_spread + 0.25 * max(alpha, 0.0))
-        ask_quote = ceil(reservation_price + half_spread + 0.25 * min(alpha, 0.0))
+        bid_quote = floor(reservation_price - ROOT_BASE_HALF_SPREAD + directional_push)
+        ask_quote = ceil(reservation_price + ROOT_BASE_HALF_SPREAD - directional_push)
 
         if best_bid is not None:
             bid_quote = max(bid_quote, best_bid + 1)
@@ -499,93 +390,38 @@ class AggressivePepperProduct(Product):
         if best_bid is not None:
             ask_quote = max(ask_quote, best_bid + ROOT_MIN_EDGE)
 
-        if self.pending_position > 0:
-            ask_quote -= ceil(1.5 + 4.0 * inv_ratio + 1.2 * max(-alpha, 0.0))
-            if best_bid is not None:
-                ask_quote = max(best_bid + 1, ask_quote)
-            if best_ask is not None:
-                ask_quote = min(best_ask, ask_quote)
-
-        if self.pending_position < 0:
-            bid_quote += ceil(1.5 + 4.0 * inv_ratio + 1.2 * max(alpha, 0.0))
-            if best_ask is not None:
-                bid_quote = min(best_ask - 1, bid_quote)
-            if best_bid is not None:
-                bid_quote = max(best_bid, bid_quote)
-
         if bid_quote >= ask_quote:
             center = round(reservation_price)
             bid_quote = center - ROOT_MIN_EDGE
             ask_quote = center + ROOT_MIN_EDGE
 
-        base_size = max(5, round((self.quote_size + signal_strength * self.signal_size_boost) * (1 - 0.25 * inv_ratio)))
-        buy_size = min(base_size, self.remaining_buy_capacity())
-        sell_size = min(base_size, self.remaining_sell_capacity())
-
-        if alpha > 0:
-            buy_size = min(self.remaining_buy_capacity(), round(buy_size * (1.15 + 0.5 * signal_strength)))
-            if self.pending_position > 0:
-                sell_size = min(self.remaining_sell_capacity(), round(sell_size * (1.1 + 0.5 * inv_ratio)))
-        elif alpha < 0:
-            sell_size = min(self.remaining_sell_capacity(), round(sell_size * (1.15 + 0.5 * signal_strength)))
-            if self.pending_position < 0:
-                buy_size = min(self.remaining_buy_capacity(), round(buy_size * (1.1 + 0.5 * inv_ratio)))
-
-        if self.pending_position > 0:
-            sell_size = min(self.remaining_sell_capacity(), round(max(sell_size, base_size * (1.0 + 1.25 * inv_ratio))))
-        elif self.pending_position < 0:
-            buy_size = min(self.remaining_buy_capacity(), round(max(buy_size, base_size * (1.0 + 1.25 * inv_ratio))))
-
-        buy_front = clamp(0.68 + 0.15 * max(alpha, 0.0), 0.58, 0.92)
-        sell_front = clamp(0.68 + 0.15 * max(-alpha, 0.0), 0.58, 0.92)
-
-        if self.pending_position > 0:
-            sell_front = clamp(sell_front + 0.12 + 0.1 * inv_ratio, 0.58, 0.97)
-        elif self.pending_position < 0:
-            buy_front = clamp(buy_front + 0.12 + 0.1 * inv_ratio, 0.58, 0.97)
-
-        return bid_quote, ask_quote, buy_size, sell_size, buy_front, sell_front
+        return bid_quote, ask_quote
 
     def build_orders(self) -> List[Order]:
         best_bid, bid_volume, best_ask, ask_volume = self.best_bid_ask()
-        history, spreads = self.collect_state(best_bid, bid_volume, best_ask, ask_volume)
+        history = self.parse_history()
+
+        if best_bid is not None and best_ask is not None and best_bid < best_ask:
+            history.append((best_bid + best_ask) / 2)
+        history = history[-ROOT_HISTORY_LENGTH:]
+        self.save_history(history)
+
         if not history:
             return self.orders
 
-        fair_value, signal_strength, alpha, realized_vol, avg_spread = self.fair_value(
-            history,
-            spreads,
-            best_bid,
-            best_ask,
-            bid_volume,
-            ask_volume,
-        )
-        self.take_liquidity(fair_value, signal_strength, alpha, realized_vol)
+        fair_value, signal_strength = self.fair_value(history, best_bid, best_ask, bid_volume, ask_volume)
+        self.take_liquidity(fair_value)
 
         best_bid, bid_volume, best_ask, ask_volume = self.best_bid_ask()
-        bid_quote, ask_quote, buy_size, sell_size, buy_front, sell_front = self.make_quotes(
-            fair_value,
-            signal_strength,
-            alpha,
-            realized_vol,
-            avg_spread,
-            best_bid,
-            best_ask,
-        )
-        self.quote_two_levels(
-            bid_quote,
-            ask_quote,
-            buy_size,
-            sell_size,
-            front_ratio_buy=buy_front,
-            front_ratio_sell=sell_front,
-        )
+        fair_value, signal_strength = self.fair_value(history, best_bid, best_ask, bid_volume, ask_volume)
+        bid_quote, ask_quote = self.make_quotes(fair_value, best_bid, best_ask, signal_strength)
+        self.quote_two_levels(bid_quote, ask_quote, signal_strength)
         return self.orders
 
 
 class Trader:
     @staticmethod
-    def decode_trader_data(trader_data: str) -> Dict[str, object]:
+    def decode_trader_data(trader_data: str) -> Dict[str, str]:
         if not trader_data:
             return {}
 
@@ -593,7 +429,7 @@ class Trader:
             decoded = json.loads(trader_data)
             return decoded if isinstance(decoded, dict) else {}
         except json.JSONDecodeError:
-            decoded: Dict[str, object] = {}
+            decoded: Dict[str, str] = {}
             for segment in trader_data.split(";"):
                 if "=" not in segment:
                     continue
@@ -603,9 +439,9 @@ class Trader:
             return decoded
 
     @staticmethod
-    def encode_trader_data(trader_state: Dict[str, object]) -> str:
+    def encode_trader_data(trader_state: Dict[str, str]) -> str:
         try:
-            return json.dumps(trader_state, separators=(",", ":"))
+            return json.dumps(trader_state)
         except (TypeError, ValueError):
             return ""
 
@@ -628,6 +464,6 @@ class Trader:
 
         dynamic_symbol = self.first_available_symbol(state.order_depths, INTARIAN_PEPPER_ROOT_ALIASES)
         if dynamic_symbol is not None:
-            orders[dynamic_symbol] = AggressivePepperProduct(dynamic_symbol, state, trader_state).build_orders()
+            orders[dynamic_symbol] = DynamicProduct(dynamic_symbol, state, trader_state).build_orders()
 
         return orders, 0, self.encode_trader_data(trader_state)
